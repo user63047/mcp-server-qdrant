@@ -90,15 +90,13 @@ class QdrantMCPServer(FastMCP):
         Register the tools in the server.
         """
 
+        # ===== STORE TOOL =====
         async def store(
             ctx: Context,
             information: Annotated[str, Field(description="Text to store")],
             collection_name: Annotated[
                 str, Field(description="The collection to store the information in")
             ],
-            # The `metadata` parameter is defined as non-optional, but it can be None.
-            # If we set it to be optional, some of the MCP clients, like Cursor, cannot
-            # handle the optional parameter correctly.
             metadata: Annotated[
                 Metadata | None,
                 Field(
@@ -108,12 +106,6 @@ class QdrantMCPServer(FastMCP):
         ) -> str:
             """
             Store some information in Qdrant.
-            :param ctx: The context for the request.
-            :param information: The information to store.
-            :param metadata: JSON metadata to store with the information, optional.
-            :param collection_name: The name of the collection to store the information in, optional. If not provided,
-                                    the default collection is used.
-            :return: A message indicating that the information was stored.
             """
             await ctx.debug(f"Storing information {information} in Qdrant")
 
@@ -124,6 +116,7 @@ class QdrantMCPServer(FastMCP):
                 return f"Remembered: {information} in collection {collection_name}"
             return f"Remembered: {information}"
 
+        # ===== FIND TOOL =====
         async def find(
             ctx: Context,
             query: Annotated[str, Field(description="What to search for")],
@@ -134,15 +127,7 @@ class QdrantMCPServer(FastMCP):
         ) -> list[str] | None:
             """
             Find memories in Qdrant.
-            :param ctx: The context for the request.
-            :param query: The query to use for the search.
-            :param collection_name: The name of the collection to search in, optional. If not provided,
-                                    the default collection is used.
-            :param query_filter: The filter to apply to the query.
-            :return: A list of entries found or None.
             """
-
-            # Log query_filter
             await ctx.debug(f"Query filter: {query_filter}")
 
             query_filter = models.Filter(**query_filter) if query_filter else None
@@ -164,9 +149,129 @@ class QdrantMCPServer(FastMCP):
                 content.append(self.format_entry(entry))
             return content
 
+        # ===== DELETE TOOL =====
+        async def delete(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection to delete from")
+            ],
+            filter: Annotated[
+                dict, Field(description="Filter criteria (e.g. {'category': 'test'})")
+            ],
+        ) -> str:
+            """
+            Delete entries matching the filter from Qdrant.
+            """
+            await ctx.debug(f"Deleting entries with filter {filter} from {collection_name}")
+
+            count = await self.qdrant_connector.delete(
+                filter, collection_name=collection_name
+            )
+            return f"Deleted {count} entries from {collection_name}"
+
+        # ===== UPDATE TOOL =====
+        async def update(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection to update")
+            ],
+            filter: Annotated[
+                dict, Field(description="Filter to identify entries to update")
+            ],
+            new_information: Annotated[
+                str, Field(description="New content for the entries")
+            ],
+            new_metadata: Annotated[
+                Metadata | None, Field(description="New metadata (optional)")
+            ] = None,
+        ) -> str:
+            """
+            Update entries matching the filter with new content. This creates new embeddings.
+            """
+            await ctx.debug(f"Updating entries with filter {filter} in {collection_name}")
+
+            count = await self.qdrant_connector.update(
+                filter, new_information, new_metadata, collection_name=collection_name
+            )
+            return f"Updated {count} entries in {collection_name}"
+
+        # ===== SET METADATA TOOL =====
+        async def set_metadata(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection")
+            ],
+            filter: Annotated[
+                dict, Field(description="Filter to identify entries")
+            ],
+            metadata: Annotated[
+                dict, Field(description="Metadata fields to set/update")
+            ],
+        ) -> str:
+            """
+            Set or update metadata on entries matching the filter without changing embeddings.
+            """
+            await ctx.debug(f"Setting metadata on entries with filter {filter} in {collection_name}")
+
+            count = await self.qdrant_connector.set_metadata(
+                filter, metadata, collection_name=collection_name
+            )
+            return f"Updated metadata on {count} entries in {collection_name}"
+
+        # ===== LIST TOOL =====
+        async def list_entries(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection to list")
+            ],
+            filter: Annotated[
+                dict | None, Field(description="Optional filter criteria")
+            ] = None,
+            limit: Annotated[
+                int, Field(description="Maximum number of entries to return")
+            ] = 10,
+        ) -> list[str] | None:
+            """
+            List entries in a collection, optionally filtered by metadata.
+            """
+            await ctx.debug(f"Listing entries from {collection_name} with filter {filter}")
+
+            entries = await self.qdrant_connector.list_entries(
+                filter, limit=limit, collection_name=collection_name
+            )
+            if not entries:
+                return None
+            content = [
+                f"Entries in collection '{collection_name}' (limit: {limit})",
+            ]
+            for entry in entries:
+                content.append(self.format_entry(entry))
+            return content
+
+        # ===== COLLECTIONS TOOL =====
+        async def collections(ctx: Context) -> list[str]:
+            """
+            List all available collections in Qdrant.
+            """
+            await ctx.debug("Listing all collections")
+
+            names = await self.qdrant_connector.get_collection_names()
+            if not names:
+                return ["No collections found"]
+            return [f"Available collections: {', '.join(names)}"]
+
+        # ===== TOOL REGISTRATION =====
+        
+        # Prepare function references
         find_foo = find
         store_foo = store
+        delete_foo = delete
+        update_foo = update
+        set_metadata_foo = set_metadata
+        list_entries_foo = list_entries
+        collections_foo = collections
 
+        # Handle filterable conditions for find
         filterable_conditions = (
             self.qdrant_settings.filterable_fields_dict_with_conditions()
         )
@@ -176,6 +281,7 @@ class QdrantMCPServer(FastMCP):
         elif not self.qdrant_settings.allow_arbitrary_filter:
             find_foo = make_partial_function(find_foo, {"query_filter": None})
 
+        # Handle default collection_name
         if self.qdrant_settings.collection_name:
             find_foo = make_partial_function(
                 find_foo, {"collection_name": self.qdrant_settings.collection_name}
@@ -183,17 +289,55 @@ class QdrantMCPServer(FastMCP):
             store_foo = make_partial_function(
                 store_foo, {"collection_name": self.qdrant_settings.collection_name}
             )
+            delete_foo = make_partial_function(
+                delete_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            update_foo = make_partial_function(
+                update_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            set_metadata_foo = make_partial_function(
+                set_metadata_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            list_entries_foo = make_partial_function(
+                list_entries_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
 
+        # Register read-only tools (always available)
         self.tool(
             find_foo,
             name="qdrant-find",
             description=self.tool_settings.tool_find_description,
         )
+        self.tool(
+            list_entries_foo,
+            name="qdrant-list",
+            description=self.tool_settings.tool_list_description,
+        )
+        self.tool(
+            collections_foo,
+            name="qdrant-collections",
+            description=self.tool_settings.tool_collections_description,
+        )
 
+        # Register write tools (only if not read_only)
         if not self.qdrant_settings.read_only:
-            # Those methods can modify the database
             self.tool(
                 store_foo,
                 name="qdrant-store",
                 description=self.tool_settings.tool_store_description,
+            )
+            self.tool(
+                delete_foo,
+                name="qdrant-delete",
+                description=self.tool_settings.tool_delete_description,
+            )
+            self.tool(
+                update_foo,
+                name="qdrant-update",
+                description=self.tool_settings.tool_update_description,
+            )
+            self.tool(
+                set_metadata_foo,
+                name="qdrant-set-metadata",
+                description=self.tool_settings.tool_set_metadata_description,
             )

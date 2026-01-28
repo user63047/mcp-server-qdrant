@@ -14,6 +14,21 @@ DEFAULT_TOOL_FIND_DESCRIPTION = (
     " - Access memories for further analysis \n"
     " - Get some personal information about the user"
 )
+DEFAULT_TOOL_DELETE_DESCRIPTION = (
+    "Delete memories from Qdrant based on filter criteria like category or tags."
+)
+DEFAULT_TOOL_UPDATE_DESCRIPTION = (
+    "Update existing memories in Qdrant. This will create new embeddings."
+)
+DEFAULT_TOOL_SET_METADATA_DESCRIPTION = (
+    "Update metadata of existing memories without changing the content or embeddings."
+)
+DEFAULT_TOOL_LIST_DESCRIPTION = (
+    "List memories in a Qdrant collection, optionally filtered by metadata."
+)
+DEFAULT_TOOL_COLLECTIONS_DESCRIPTION = (
+    "List all available collections in Qdrant."
+)
 
 METADATA_PATH = "metadata"
 
@@ -30,6 +45,26 @@ class ToolSettings(BaseSettings):
     tool_find_description: str = Field(
         default=DEFAULT_TOOL_FIND_DESCRIPTION,
         validation_alias="TOOL_FIND_DESCRIPTION",
+    )
+    tool_delete_description: str = Field(
+        default=DEFAULT_TOOL_DELETE_DESCRIPTION,
+        validation_alias="TOOL_DELETE_DESCRIPTION",
+    )
+    tool_update_description: str = Field(
+        default=DEFAULT_TOOL_UPDATE_DESCRIPTION,
+        validation_alias="TOOL_UPDATE_DESCRIPTION",
+    )
+    tool_set_metadata_description: str = Field(
+        default=DEFAULT_TOOL_SET_METADATA_DESCRIPTION,
+        validation_alias="TOOL_SET_METADATA_DESCRIPTION",
+    )
+    tool_list_description: str = Field(
+        default=DEFAULT_TOOL_LIST_DESCRIPTION,
+        validation_alias="TOOL_LIST_DESCRIPTION",
+    )
+    tool_collections_description: str = Field(
+        default=DEFAULT_TOOL_COLLECTIONS_DESCRIPTION,
+        validation_alias="TOOL_COLLECTIONS_DESCRIPTION",
     )
 
 

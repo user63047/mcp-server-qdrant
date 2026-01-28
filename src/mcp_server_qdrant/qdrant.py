@@ -1,5 +1,6 @@
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel
@@ -72,13 +73,16 @@ class QdrantConnector:
         await self._ensure_collection_exists(collection_name)
 
         # Embed the document
-        # ToDo: instead of embedding text explicitly, use `models.Document`,
-        # it should unlock usage of server-side inference.
         embeddings = await self._embedding_provider.embed_documents([entry.content])
+
+        # Add created_at timestamp if not present
+        metadata = entry.metadata or {}
+        if "created_at" not in metadata:
+            metadata["created_at"] = datetime.now(timezone.utc).isoformat()
 
         # Add to Qdrant
         vector_name = self._embedding_provider.get_vector_name()
-        payload = {"document": entry.content, METADATA_PATH: entry.metadata}
+        payload = {"document": entry.content, METADATA_PATH: metadata}
         await self._client.upsert(
             collection_name=collection_name,
             points=[
@@ -113,10 +117,6 @@ class QdrantConnector:
         if not collection_exists:
             return []
 
-        # Embed the query
-        # ToDo: instead of embedding text explicitly, use `models.Document`,
-        # it should unlock usage of server-side inference.
-
         query_vector = await self._embedding_provider.embed_query(query)
         vector_name = self._embedding_provider.get_vector_name()
 
@@ -136,6 +136,251 @@ class QdrantConnector:
             )
             for result in search_results.points
         ]
+
+    async def delete(
+        self,
+        filter_dict: dict,
+        *,
+        collection_name: str | None = None,
+    ) -> int:
+        """
+        Delete entries based on a filter.
+        :param filter_dict: The filter criteria (e.g. {"category": "test"}).
+        :param collection_name: The name of the collection to delete from.
+        :return: Number of deleted entries (estimated).
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+        
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return 0
+
+        qdrant_filter = self._build_filter(filter_dict)
+        if not qdrant_filter:
+            return 0
+
+        # Count entries before deletion (for return value)
+        count_before = await self._count_by_filter(collection_name, qdrant_filter)
+
+        # Delete entries matching the filter
+        await self._client.delete(
+            collection_name=collection_name,
+            points_selector=models.FilterSelector(filter=qdrant_filter),
+        )
+
+        return count_before
+
+    async def update(
+        self,
+        filter_dict: dict,
+        new_content: str,
+        new_metadata: Metadata | None = None,
+        *,
+        collection_name: str | None = None,
+    ) -> int:
+        """
+        Update entries matching the filter with new content (creates new embeddings).
+        :param filter_dict: The filter criteria to identify entries.
+        :param new_content: The new text content.
+        :param new_metadata: New metadata (optional).
+        :param collection_name: The name of the collection.
+        :return: Number of updated entries.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+        
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return 0
+
+        qdrant_filter = self._build_filter(filter_dict)
+        if not qdrant_filter:
+            return 0
+
+        # Find existing entries to preserve created_at
+        existing_entries = await self._scroll_entries(collection_name, qdrant_filter, limit=100)
+        if not existing_entries:
+            return 0
+
+        # Delete old entries
+        await self._client.delete(
+            collection_name=collection_name,
+            points_selector=models.FilterSelector(filter=qdrant_filter),
+        )
+
+        # Create new embedding
+        embeddings = await self._embedding_provider.embed_documents([new_content])
+        vector_name = self._embedding_provider.get_vector_name()
+
+        # Prepare metadata with updated_at timestamp
+        metadata = new_metadata or {}
+        metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+        
+        # Preserve created_at from first existing entry if not in new metadata
+        if "created_at" not in metadata and existing_entries:
+            old_metadata = existing_entries[0].metadata or {}
+            if "created_at" in old_metadata:
+                metadata["created_at"] = old_metadata["created_at"]
+
+        # Store new entry
+        payload = {"document": new_content, METADATA_PATH: metadata}
+        await self._client.upsert(
+            collection_name=collection_name,
+            points=[
+                models.PointStruct(
+                    id=uuid.uuid4().hex,
+                    vector={vector_name: embeddings[0]},
+                    payload=payload,
+                )
+            ],
+        )
+
+        return len(existing_entries)
+
+    async def set_metadata(
+        self,
+        filter_dict: dict,
+        metadata: Metadata,
+        *,
+        collection_name: str | None = None,
+    ) -> int:
+        """
+        Set/update metadata on entries matching the filter without creating new embeddings.
+        :param filter_dict: The filter criteria to identify entries.
+        :param metadata: The metadata fields to set/update.
+        :param collection_name: The name of the collection.
+        :return: Number of updated entries.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+        
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return 0
+
+        qdrant_filter = self._build_filter(filter_dict)
+        if not qdrant_filter:
+            return 0
+
+        # Count entries before update (for return value)
+        count = await self._count_by_filter(collection_name, qdrant_filter)
+        if count == 0:
+            return 0
+
+        # Add updated_at timestamp
+        metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Build payload with metadata path prefix
+        payload_updates = {f"{METADATA_PATH}.{key}": value for key, value in metadata.items()}
+
+        # Update metadata
+        await self._client.set_payload(
+            collection_name=collection_name,
+            payload=payload_updates,
+            points=models.FilterSelector(filter=qdrant_filter),
+        )
+
+        return count
+
+    async def list_entries(
+        self,
+        filter_dict: dict | None = None,
+        limit: int = 10,
+        *,
+        collection_name: str | None = None,
+    ) -> list[Entry]:
+        """
+        List entries in a collection, optionally filtered.
+        :param filter_dict: Optional filter criteria.
+        :param limit: Maximum number of entries to return.
+        :param collection_name: The name of the collection.
+        :return: List of entries.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+        
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return []
+
+        qdrant_filter = self._build_filter(filter_dict) if filter_dict else None
+        
+        return await self._scroll_entries(collection_name, qdrant_filter, limit)
+
+    def _build_filter(self, filter_dict: dict) -> models.Filter | None:
+        """
+        Convert a simple dict into a Qdrant Filter.
+        
+        Input:  {"category": "homelab", "source": "chat"}
+        Output: models.Filter with must-conditions
+        """
+        if not filter_dict:
+            return None
+            
+        conditions = []
+        for key, value in filter_dict.items():
+            # Add metadata prefix if not already present
+            field_key = f"{METADATA_PATH}.{key}" if not key.startswith(f"{METADATA_PATH}.") else key
+            
+            if isinstance(value, list):
+                # Match any of the values
+                conditions.append(
+                    models.FieldCondition(
+                        key=field_key,
+                        match=models.MatchAny(any=value)
+                    )
+                )
+            else:
+                # Exact match
+                conditions.append(
+                    models.FieldCondition(
+                        key=field_key,
+                        match=models.MatchValue(value=value)
+                    )
+                )
+        
+        return models.Filter(must=conditions) if conditions else None
+
+    async def _scroll_entries(
+        self,
+        collection_name: str,
+        qdrant_filter: models.Filter | None,
+        limit: int,
+    ) -> list[Entry]:
+        """
+        Scroll through entries in a collection.
+        """
+        results, _ = await self._client.scroll(
+            collection_name=collection_name,
+            scroll_filter=qdrant_filter,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        return [
+            Entry(
+                content=point.payload["document"],
+                metadata=point.payload.get("metadata"),
+            )
+            for point in results
+        ]
+
+    async def _count_by_filter(
+        self,
+        collection_name: str,
+        qdrant_filter: models.Filter,
+    ) -> int:
+        """
+        Count entries matching a filter.
+        """
+        result = await self._client.count(
+            collection_name=collection_name,
+            count_filter=qdrant_filter,
+            exact=True,
+        )
+        return result.count
 
     async def _ensure_collection_exists(self, collection_name: str):
         """
@@ -160,7 +405,6 @@ class QdrantConnector:
             )
 
             # Create payload indexes if configured
-
             if self._field_indexes:
                 for field_name, field_type in self._field_indexes.items():
                     await self._client.create_payload_index(
