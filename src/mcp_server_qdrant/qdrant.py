@@ -183,7 +183,7 @@ class QdrantConnector:
         Update entries matching the filter with new content (creates new embeddings).
         :param filter_dict: The filter criteria to identify entries.
         :param new_content: The new text content.
-        :param new_metadata: New metadata (optional).
+        :param new_metadata: New metadata to merge with existing (optional).
         :param collection_name: The name of the collection.
         :return: Number of updated entries.
         """
@@ -198,7 +198,7 @@ class QdrantConnector:
         if not qdrant_filter:
             return 0
 
-        # Find existing entries to preserve created_at
+        # Find existing entries to preserve metadata
         existing_entries = await self._scroll_entries(collection_name, qdrant_filter, limit=100)
         if not existing_entries:
             return 0
@@ -213,15 +213,16 @@ class QdrantConnector:
         embeddings = await self._embedding_provider.embed_documents([new_content])
         vector_name = self._embedding_provider.get_vector_name()
 
-        # Prepare metadata with updated_at timestamp
-        metadata = new_metadata or {}
-        metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+        # Preserve old metadata and merge with new
+        old_metadata = existing_entries[0].metadata or {}
+        metadata = old_metadata.copy()
         
-        # Preserve created_at from first existing entry if not in new metadata
-        if "created_at" not in metadata and existing_entries:
-            old_metadata = existing_entries[0].metadata or {}
-            if "created_at" in old_metadata:
-                metadata["created_at"] = old_metadata["created_at"]
+        # Merge new metadata if provided (overwrites existing keys)
+        if new_metadata:
+            metadata.update(new_metadata)
+        
+        # Always update the updated_at timestamp
+        metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         # Store new entry
         payload = {"document": new_content, METADATA_PATH: metadata}
