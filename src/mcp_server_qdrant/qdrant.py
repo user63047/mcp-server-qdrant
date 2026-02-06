@@ -24,6 +24,16 @@ class Entry(BaseModel):
     metadata: Metadata | None = None
 
 
+class EntryWithId(BaseModel):
+    """
+    A single entry in the Qdrant collection with its point ID.
+    """
+
+    id: str
+    content: str
+    metadata: Metadata | None = None
+
+
 class QdrantConnector:
     """
     Encapsulates the connection to a Qdrant server and all the methods to interact with it.
@@ -264,25 +274,29 @@ class QdrantConnector:
         if not qdrant_filter:
             return 0
 
-        # Count entries before update (for return value)
-        count = await self._count_by_filter(collection_name, qdrant_filter)
-        if count == 0:
+        # Get entries with IDs so we can update them properly
+        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit=100)
+        if not entries_with_ids:
             return 0
 
         # Add updated_at timestamp
         metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        # Build payload with metadata path prefix
-        payload_updates = {f"{METADATA_PATH}.{key}": value for key, value in metadata.items()}
+        # Update each entry's metadata properly
+        for entry in entries_with_ids:
+            # Merge existing metadata with new metadata
+            existing_metadata = entry.metadata or {}
+            updated_metadata = existing_metadata.copy()
+            updated_metadata.update(metadata)
+            
+            # Overwrite the entire metadata object
+            await self._client.set_payload(
+                collection_name=collection_name,
+                payload={METADATA_PATH: updated_metadata},
+                points=[entry.id],
+            )
 
-        # Update metadata
-        await self._client.set_payload(
-            collection_name=collection_name,
-            payload=payload_updates,
-            points=models.FilterSelector(filter=qdrant_filter),
-        )
-
-        return count
+        return len(entries_with_ids)
 
     async def list_entries(
         self,
@@ -362,6 +376,32 @@ class QdrantConnector:
 
         return [
             Entry(
+                content=point.payload["document"],
+                metadata=point.payload.get("metadata"),
+            )
+            for point in results
+        ]
+
+    async def _scroll_entries_with_ids(
+        self,
+        collection_name: str,
+        qdrant_filter: models.Filter | None,
+        limit: int,
+    ) -> list[EntryWithId]:
+        """
+        Scroll through entries in a collection, including point IDs.
+        """
+        results, _ = await self._client.scroll(
+            collection_name=collection_name,
+            scroll_filter=qdrant_filter,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        return [
+            EntryWithId(
+                id=point.id,
                 content=point.payload["document"],
                 metadata=point.payload.get("metadata"),
             )
