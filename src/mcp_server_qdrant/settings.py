@@ -18,7 +18,10 @@ DEFAULT_TOOL_DELETE_DESCRIPTION = (
     "Delete memories from Qdrant based on filter criteria like category or tags."
 )
 DEFAULT_TOOL_UPDATE_DESCRIPTION = (
-    "Update existing memories in Qdrant. This will create new embeddings."
+    "Replace the content of existing memories in Qdrant (creates new embeddings). "
+    "This REPLACES the entire content - if user wants to APPEND/ADD text, first use qdrant-find or qdrant-list "
+    "to get the existing content, then combine old + new text before updating. "
+    "Filter by metadata fields like 'category', 'tags', or 'source', or by 'content' for text search."
 )
 DEFAULT_TOOL_SET_METADATA_DESCRIPTION = (
     "Update metadata of existing memories without changing the content or embeddings."
