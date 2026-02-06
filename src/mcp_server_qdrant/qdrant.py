@@ -298,6 +298,108 @@ class QdrantConnector:
 
         return len(entries_with_ids)
 
+    async def add_tags(
+        self,
+        filter_dict: dict,
+        tags: list[str],
+        *,
+        collection_name: str | None = None,
+    ) -> int:
+        """
+        Add tags to entries matching the filter without removing existing tags.
+        :param filter_dict: The filter criteria to identify entries.
+        :param tags: The tags to add.
+        :param collection_name: The name of the collection.
+        :return: Number of updated entries.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+        
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return 0
+
+        qdrant_filter = self._build_filter(filter_dict)
+        if not qdrant_filter:
+            return 0
+
+        # Get entries with IDs so we can update them properly
+        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit=100)
+        if not entries_with_ids:
+            return 0
+
+        # Update each entry's tags
+        for entry in entries_with_ids:
+            existing_metadata = entry.metadata or {}
+            existing_tags = existing_metadata.get("tags", [])
+            
+            # Merge tags (avoid duplicates)
+            merged_tags = list(set(existing_tags + tags))
+            
+            # Update metadata
+            updated_metadata = existing_metadata.copy()
+            updated_metadata["tags"] = merged_tags
+            updated_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+            
+            await self._client.set_payload(
+                collection_name=collection_name,
+                payload={METADATA_PATH: updated_metadata},
+                points=[entry.id],
+            )
+
+        return len(entries_with_ids)
+
+    async def remove_tags(
+        self,
+        filter_dict: dict,
+        tags: list[str],
+        *,
+        collection_name: str | None = None,
+    ) -> int:
+        """
+        Remove specific tags from entries matching the filter.
+        :param filter_dict: The filter criteria to identify entries.
+        :param tags: The tags to remove.
+        :param collection_name: The name of the collection.
+        :return: Number of updated entries.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+        
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return 0
+
+        qdrant_filter = self._build_filter(filter_dict)
+        if not qdrant_filter:
+            return 0
+
+        # Get entries with IDs so we can update them properly
+        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit=100)
+        if not entries_with_ids:
+            return 0
+
+        # Update each entry's tags
+        for entry in entries_with_ids:
+            existing_metadata = entry.metadata or {}
+            existing_tags = existing_metadata.get("tags", [])
+            
+            # Remove specified tags
+            filtered_tags = [t for t in existing_tags if t not in tags]
+            
+            # Update metadata
+            updated_metadata = existing_metadata.copy()
+            updated_metadata["tags"] = filtered_tags
+            updated_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+            
+            await self._client.set_payload(
+                collection_name=collection_name,
+                payload={METADATA_PATH: updated_metadata},
+                points=[entry.id],
+            )
+
+        return len(entries_with_ids)
+
     async def list_entries(
         self,
         filter_dict: dict | None = None,

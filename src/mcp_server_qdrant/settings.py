@@ -29,6 +29,12 @@ DEFAULT_TOOL_LIST_DESCRIPTION = (
 DEFAULT_TOOL_COLLECTIONS_DESCRIPTION = (
     "List all available collections in Qdrant."
 )
+DEFAULT_TOOL_ADD_TAGS_DESCRIPTION = (
+    "Add tags to existing memories without removing existing tags."
+)
+DEFAULT_TOOL_REMOVE_TAGS_DESCRIPTION = (
+    "Remove specific tags from existing memories."
+)
 
 METADATA_PATH = "metadata"
 
@@ -65,6 +71,14 @@ class ToolSettings(BaseSettings):
     tool_collections_description: str = Field(
         default=DEFAULT_TOOL_COLLECTIONS_DESCRIPTION,
         validation_alias="TOOL_COLLECTIONS_DESCRIPTION",
+    )
+    tool_add_tags_description: str = Field(
+        default=DEFAULT_TOOL_ADD_TAGS_DESCRIPTION,
+        validation_alias="TOOL_ADD_TAGS_DESCRIPTION",
+    )
+    tool_remove_tags_description: str = Field(
+        default=DEFAULT_TOOL_REMOVE_TAGS_DESCRIPTION,
+        validation_alias="TOOL_REMOVE_TAGS_DESCRIPTION",
     )
 
 

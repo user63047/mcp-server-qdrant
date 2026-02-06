@@ -218,6 +218,52 @@ class QdrantMCPServer(FastMCP):
             )
             return f"Updated metadata on {count} entries in {collection_name}"
 
+        # ===== ADD TAGS TOOL =====
+        async def add_tags(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection")
+            ],
+            filter: Annotated[
+                dict, Field(description="Filter to identify entries")
+            ],
+            tags: Annotated[
+                list[str], Field(description="Tags to add")
+            ],
+        ) -> str:
+            """
+            Add tags to entries matching the filter without removing existing tags.
+            """
+            await ctx.debug(f"Adding tags {tags} to entries with filter {filter} in {collection_name}")
+
+            count = await self.qdrant_connector.add_tags(
+                filter, tags, collection_name=collection_name
+            )
+            return f"Added tags {tags} to {count} entries in {collection_name}"
+
+        # ===== REMOVE TAGS TOOL =====
+        async def remove_tags(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection")
+            ],
+            filter: Annotated[
+                dict, Field(description="Filter to identify entries")
+            ],
+            tags: Annotated[
+                list[str], Field(description="Tags to remove")
+            ],
+        ) -> str:
+            """
+            Remove specific tags from entries matching the filter.
+            """
+            await ctx.debug(f"Removing tags {tags} from entries with filter {filter} in {collection_name}")
+
+            count = await self.qdrant_connector.remove_tags(
+                filter, tags, collection_name=collection_name
+            )
+            return f"Removed tags {tags} from {count} entries in {collection_name}"
+
         # ===== LIST TOOL =====
         async def list_entries(
             ctx: Context,
@@ -270,6 +316,8 @@ class QdrantMCPServer(FastMCP):
         set_metadata_foo = set_metadata
         list_entries_foo = list_entries
         collections_foo = collections
+        add_tags_foo = add_tags
+        remove_tags_foo = remove_tags
 
         # Handle filterable conditions for find
         filterable_conditions = (
@@ -300,6 +348,12 @@ class QdrantMCPServer(FastMCP):
             )
             list_entries_foo = make_partial_function(
                 list_entries_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            add_tags_foo = make_partial_function(
+                add_tags_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            remove_tags_foo = make_partial_function(
+                remove_tags_foo, {"collection_name": self.qdrant_settings.collection_name}
             )
 
         # Register read-only tools (always available)
@@ -340,4 +394,14 @@ class QdrantMCPServer(FastMCP):
                 set_metadata_foo,
                 name="qdrant-set-metadata",
                 description=self.tool_settings.tool_set_metadata_description,
+            )
+            self.tool(
+                add_tags_foo,
+                name="qdrant-add-tags",
+                description=self.tool_settings.tool_add_tags_description,
+            )
+            self.tool(
+                remove_tags_foo,
+                name="qdrant-remove-tags",
+                description=self.tool_settings.tool_remove_tags_description,
             )
