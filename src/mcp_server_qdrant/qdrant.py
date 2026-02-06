@@ -429,7 +429,13 @@ class QdrantConnector:
         """
         Convert a simple dict into a Qdrant Filter.
         
-        Input:  {"category": "homelab", "source": "chat"}
+        Supports:
+        - Metadata fields: {"category": "homelab"} -> exact match
+        - Content field: {"content": "text"} -> substring/text match
+        
+        Multiple conditions are combined with AND.
+        
+        Input:  {"category": "homelab", "content": "server"}
         Output: models.Filter with must-conditions
         """
         if not filter_dict:
@@ -437,25 +443,35 @@ class QdrantConnector:
             
         conditions = []
         for key, value in filter_dict.items():
-            # Add metadata prefix if not already present
-            field_key = f"{METADATA_PATH}.{key}" if not key.startswith(f"{METADATA_PATH}.") else key
-            
-            if isinstance(value, list):
-                # Match any of the values
-                conditions.append(
-                    models.FieldCondition(
-                        key=field_key,
-                        match=models.MatchAny(any=value)
+            # Handle content/document field with text match (substring search)
+            if key in ("content", "document"):
+                if isinstance(value, str):
+                    conditions.append(
+                        models.FieldCondition(
+                            key="document",
+                            match=models.MatchText(text=value)
+                        )
                     )
-                )
+            # Handle metadata fields with exact match
             else:
-                # Exact match
-                conditions.append(
-                    models.FieldCondition(
-                        key=field_key,
-                        match=models.MatchValue(value=value)
+                field_key = key if key.startswith(f"{METADATA_PATH}.") else f"{METADATA_PATH}.{key}"
+                
+                if isinstance(value, list):
+                    # Match any of the values
+                    conditions.append(
+                        models.FieldCondition(
+                            key=field_key,
+                            match=models.MatchAny(any=value)
+                        )
                     )
-                )
+                else:
+                    # Exact match
+                    conditions.append(
+                        models.FieldCondition(
+                            key=field_key,
+                            match=models.MatchValue(value=value)
+                        )
+                    )
         
         return models.Filter(must=conditions) if conditions else None
 
