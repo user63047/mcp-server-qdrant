@@ -90,6 +90,10 @@ class QdrantConnector:
         if "created_at" not in metadata:
             metadata["created_at"] = datetime.now(timezone.utc).isoformat()
 
+        # Initialize access tracking
+        metadata["relevance_score"] = 0
+        metadata["last_accessed_at"] = metadata["created_at"]
+
         # Add to Qdrant
         vector_name = self._embedding_provider.get_vector_name()
         payload = {"document": entry.content, METADATA_PATH: metadata}
@@ -138,6 +142,10 @@ class QdrantConnector:
             limit=limit,
             query_filter=query_filter,
         )
+
+        # Update access tracking for found entries (find = +3)
+        point_ids = [result.id for result in search_results.points]
+        await self._update_access_tracking(collection_name, point_ids, score_increment=3)
 
         return [
             Entry(
@@ -232,7 +240,13 @@ class QdrantConnector:
             metadata.update(new_metadata)
         
         # Always update the updated_at timestamp
-        metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        metadata["updated_at"] = now
+
+        # Update access tracking (update = +2)
+        current_score = metadata.get("relevance_score", 0)
+        metadata["relevance_score"] = current_score + 2
+        metadata["last_accessed_at"] = now
 
         # Store new entry
         payload = {"document": new_content, METADATA_PATH: metadata}
@@ -422,8 +436,20 @@ class QdrantConnector:
             return []
 
         qdrant_filter = self._build_filter(filter_dict) if filter_dict else None
-        
-        return await self._scroll_entries(collection_name, qdrant_filter, limit)
+
+        # Use scroll with IDs to enable access tracking
+        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit)
+        if not entries_with_ids:
+            return []
+
+        # Update access tracking for listed entries (list = +1)
+        point_ids = [entry.id for entry in entries_with_ids]
+        await self._update_access_tracking(collection_name, point_ids, score_increment=1)
+
+        return [
+            Entry(content=entry.content, metadata=entry.metadata)
+            for entry in entries_with_ids
+        ]
 
     def _build_filter(self, filter_dict: dict) -> models.Filter | None:
         """
@@ -525,6 +551,49 @@ class QdrantConnector:
             )
             for point in results
         ]
+
+    async def _update_access_tracking(
+        self,
+        collection_name: str,
+        point_ids: list[str],
+        score_increment: int,
+    ):
+        """
+        Update access tracking metadata for the given points.
+        Increments relevance_score and updates last_accessed_at.
+        :param collection_name: The name of the collection.
+        :param point_ids: List of point IDs to update.
+        :param score_increment: How much to increment the relevance_score.
+        """
+        if not point_ids:
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        for point_id in point_ids:
+            # Get current metadata
+            points = await self._client.retrieve(
+                collection_name=collection_name,
+                ids=[point_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                continue
+
+            existing_metadata = points[0].payload.get("metadata", {})
+            current_score = existing_metadata.get("relevance_score", 0)
+
+            # Update tracking fields
+            updated_metadata = existing_metadata.copy()
+            updated_metadata["relevance_score"] = current_score + score_increment
+            updated_metadata["last_accessed_at"] = now
+
+            await self._client.set_payload(
+                collection_name=collection_name,
+                payload={METADATA_PATH: updated_metadata},
+                points=[point_id],
+            )
 
     async def _count_by_filter(
         self,
