@@ -1,85 +1,130 @@
-# mcp-server-qdrant (Fork with Ollama & Extended Tools)
+# mcp-server-qdrant (Fork with Document Chunking, Ollama & Extended Tools)
 
-Fork of the official [Qdrant MCP Server](https://github.com/qdrant/mcp-server-qdrant) with added Ollama embedding support, full CRUD operations, tag management, and intelligent access tracking with automated cleanup.
+> ⚠️ **Work in Progress** – This fork is under active development. The two-level document/chunk architecture described below is functional but not yet considered stable. External source synchronization (Trilium, PDFs, Paperless-ngx) is planned but not yet implemented. APIs and payload structures may change.
+
+Fork of the official [Qdrant MCP Server](https://github.com/qdrant/mcp-server-qdrant) with a **two-level document/chunk architecture**, Ollama embedding support, full CRUD operations, LLM-generated abstracts, tag management, and intelligent access tracking with automated cleanup.
 
 ## What's Different from the Original?
 
+- **Two-Level Architecture** – Documents are automatically split into embedding-friendly chunks, solving the silent truncation problem when texts exceed the embedding model's context window
+- **Document-Level Operations** – All tools operate on documents (grouped by `document_id`), not individual vector points
+- **Source Type Distinction** – Differentiates between `composed` entries (created and managed in Qdrant) and external sources (indexed from other systems)
+- **LLM-Generated Abstracts** – Optional document summaries via Ollama, stored on every chunk for fast retrieval
 - **Ollama as Embedding Provider** – Use local Ollama models instead of cloud-based embeddings
-- **Full CRUD Operations** – Update, delete, and manage entries (not just store & find)
-- **Collection Management** – List all available collections
-- **Tag Management** – Add and remove tags granularly
-- **Access Tracking** – Automatic relevance scoring based on usage patterns
-- **Cleanup Tool** – CLI tool to remove stale entries using exponential time decay
+- **Full CRUD Operations** – Store, find, update, append, delete, and manage documents
+- **Disambiguation** – When multiple documents match a filter, they are returned for the LLM to ask the user which one is meant
+- **Access Tracking & Cleanup** – Automatic relevance scoring with exponential time decay
+
+## Architecture Overview
+
+### The Problem
+
+Embedding models have a limited context window (e.g. ~2048 tokens for `embeddinggemma:300m`). Texts exceeding this limit are silently truncated during embedding — information is lost without any warning.
+
+### The Solution
+
+Documents are split into overlapping chunks that each fit the embedding model's context window. All chunks share a `document_id` and carry redundant document-level metadata, eliminating the need for secondary lookups.
+
+```
+Document "Docker Bridge Config" (4500 tokens)
+├── Chunk 0 (1500 tokens) — carries full_content + abstract + metadata
+├── Chunk 1 (1500 tokens) — carries abstract + metadata
+├── Chunk 2 (1500 tokens) — carries abstract + metadata
+└── Chunk 3 (remaining)   — carries abstract + metadata
+    ↑ 25% overlap between consecutive chunks
+```
+
+### Source Types
+
+| Source Type | Description | Content Operations | Metadata Operations |
+|---|---|---|---|
+| `composed` | Content created/managed in Qdrant | Read/Write | Read/Write |
+| `trilium` | Notes from Trilium | Read-only* | Read/Write |
+| `pdf` | PDF documents | Read-only | Read/Write |
+| `paperless` | Paperless-ngx documents | Read-only | Read/Write |
+
+*External sources are indexed into Qdrant for search. Content changes must be made at the source; the sync layer updates Qdrant automatically. Metadata (tags, category) can be changed directly in Qdrant for all source types.
+
+> **Note:** Synchronization with external sources (Trilium, PDFs, Paperless-ngx) is not yet implemented. Currently, only `composed` entries are fully functional.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `qdrant-store` | Store information with optional metadata, tags, and category |
-| `qdrant-find` | Semantic search across entries (updates relevance score +3) |
-| `qdrant-list` | List entries, optionally filtered (updates relevance score +1) |
-| `qdrant-collections` | List all available collections |
-| `qdrant-update` | Update content with new embeddings, preserves metadata (updates relevance score +2) |
-| `qdrant-set-metadata` | Change metadata without regenerating embeddings |
-| `qdrant-add-tags` | Add tags without removing existing ones |
-| `qdrant-remove-tags` | Remove specific tags |
-| `qdrant-delete` | Delete entries based on filter criteria |
+| Tool | Description | Source Types |
+|---|---|---|
+| `qdrant-store` | Store a document with title, content, and metadata | All |
+| `qdrant-find` | Semantic search, returns document-level results | All |
+| `qdrant-list` | List documents, optionally filtered by metadata | All |
+| `qdrant-collections` | List all available collections | — |
+| `qdrant-update` | Replace document content (re-chunks, re-embeds) | Composed only |
+| `qdrant-append` | Append text to existing document | Composed only |
+| `qdrant-set-metadata` | Update metadata without changing content | All |
+| `qdrant-add-tags` | Add tags without removing existing ones | All |
+| `qdrant-remove-tags` | Remove specific tags | All |
+| `qdrant-delete` | Delete a document and all its chunks | Composed only |
+
+### Disambiguation
+
+When `update`, `append`, or `delete` match multiple documents, no action is performed. Instead, the matching documents are returned (title, abstract, metadata, `document_id`) so the LLM can ask the user which document is meant. A second call with `document_id` targets the exact document.
 
 ## Filter Functionality
 
-All tools that use filters (`delete`, `update`, `set-metadata`, `add-tags`, `remove-tags`, `list`) support:
+All tools that accept filters support:
 
 | Filter Type | Example | Description |
-|-------------|---------|-------------|
-| Metadata (exact) | `{"category": "homelab"}` | Exact match on metadata fields |
-| Content (substring) | `{"content": "server"}` | Substring search in content |
-| Combined | `{"category": "homelab", "content": "server"}` | AND combination of both |
-| Tags | `{"tags": ["docker", "backup"]}` | Finds entries with any of the tags |
+|---|---|---|
+| Document ID | `{"document_id": "abc123"}` | Exact document targeting |
+| Title | `{"title": "Docker"}` | Text match on title |
+| Content | `{"content": "server"}` | Substring search in chunk text |
+| Category | `{"category": "homelab"}` | Exact match on metadata |
+| Tags | `{"tags": ["docker", "backup"]}` | Matches entries with any of the tags |
+| Source Type | `{"source_type": "composed"}` | Filter by source type |
+| Combined | `{"category": "homelab", "content": "server"}` | AND combination |
 
-## Access Tracking & Relevance Score
+## Payload Structure
 
-Entries automatically track how often and how recently they are accessed, similar to how human memory works – frequently used information stays relevant, unused information fades over time.
-
-### How It Works
-
-Each entry stores two tracking fields in its metadata:
-
-- **`relevance_score`** – Weighted access counter (initialized at 0)
-- **`last_accessed_at`** – Timestamp of the last access
-
-Different actions contribute different weights to the relevance score:
-
-| Action | Score Increment | Reasoning |
-|--------|----------------|-----------|
-| `qdrant-find` | +3 | Strongest signal – actively searched and found |
-| `qdrant-update` | +2 | Content was actively maintained |
-| `qdrant-list` | +1 | Browsing, less intentional than searching |
-
-### Metadata Structure
+Each Qdrant point (chunk) carries this payload:
 
 ```json
 {
-  "document": "The actual text content",
+  "document": "The chunk text (embedded content)",
+  "document_id": "unique-document-uuid",
+  "title": "Document Title",
+  "chunk_index": 0,
+  "abstract": "LLM-generated summary of the whole document",
+  "full_content": "Complete original text (only on chunk_index=0, only for composed)",
   "metadata": {
+    "source_type": "composed",
+    "source_ref": null,
     "category": "example",
     "tags": ["tag1", "tag2"],
-    "source": "chat",
-    "created_at": "2026-01-25T...",
-    "updated_at": "2026-01-25T...",
-    "last_accessed_at": "2026-02-01T...",
-    "relevance_score": 28
+    "created_at": "2025-...",
+    "updated_at": "2025-...",
+    "relevance_score": 5,
+    "last_accessed_at": "2025-..."
   }
 }
 ```
 
-Automatic timestamps:
-- `created_at` – Set automatically on `qdrant-store`
-- `updated_at` – Updated on `qdrant-update`, `qdrant-set-metadata`, `qdrant-add-tags`, `qdrant-remove-tags`
-- `last_accessed_at` – Updated on `qdrant-find`, `qdrant-list`, `qdrant-update`
+Key points:
+- `full_content` is **only** stored on `chunk_index: 0` and **only** for `source_type: "composed"`
+- `abstract` and `metadata` are **redundant on every chunk** to avoid secondary lookups
+- `source_ref` contains a URL/path to the external source (null for composed entries)
+
+## Access Tracking & Relevance Score
+
+Documents track access frequency and recency. Different actions contribute different weights:
+
+| Action | Score Increment | Reasoning |
+|---|---|---|
+| `qdrant-find` | +3 | Actively searched and found |
+| `qdrant-update` / `qdrant-append` | +2 | Content was actively maintained |
+| `qdrant-list` | +1 | Browsing, less intentional |
+
+Access tracking updates **all chunks** of a document to keep metadata synchronized.
 
 ## Cleanup Tool
 
-The `qdrant-cleanup` CLI tool identifies and removes stale entries using exponential time decay.
+The `qdrant-cleanup` CLI tool removes stale **composed** documents using exponential time decay. External sources are skipped — they are managed by their respective sync pipelines.
 
 ### Decay Formula
 
@@ -87,59 +132,43 @@ The `qdrant-cleanup` CLI tool identifies and removes stale entries using exponen
 effective_score = relevance_score × e^(-λ × days_since_last_access)
 ```
 
-With default λ = 0.001, scores decay over time like this:
-
-| Days Since Last Access | Decay Factor | Score 50 → Effective | Score 5 → Effective |
-|------------------------|-------------|---------------------|-------------------|
-| 0 (today) | 1.0 | 50.0 | 5.0 |
-| 365 (1 year) | 0.69 | 34.7 | 3.5 |
-| 1095 (3 years) | 0.33 | 16.7 | 1.7 |
-| 1825 (5 years) | 0.16 | 8.1 | 0.8 |
+Cleanup groups points by `document_id` and evaluates at the document level. A document is either fully deleted (all chunks) or kept — no orphaned chunks.
 
 ### Usage
 
 ```bash
-# Dry run – only show what would be deleted
-qdrant-cleanup --dry-run --qdrant-url http://localhost:6333 --qdrant-api-key your_key
+# Dry run — only show what would be deleted
+qdrant-cleanup --dry-run --qdrant-url http://localhost:6333
 
-# Delete entries below threshold
+# Delete documents below threshold
 qdrant-cleanup --qdrant-url http://localhost:6333 --qdrant-api-key your_key
 
 # Custom threshold and decay rate
 qdrant-cleanup --threshold 3.0 --decay-lambda 0.002 --qdrant-url http://localhost:6333
 
 # Only process a specific collection
-qdrant-cleanup --dry-run --collection my-collection --qdrant-url http://localhost:6333
+qdrant-cleanup --collection my-collection --qdrant-url http://localhost:6333
 ```
 
 ### CLI Options
 
 | Flag | Default | Description |
-|------|---------|-------------|
+|---|---|---|
 | `--dry-run` | off | Only report, don't delete |
-| `--threshold` | 1.0 | Effective score below which entries are deleted |
+| `--threshold` | 1.0 | Effective score below which documents are deleted |
 | `--decay-lambda` | 0.001 | Decay rate (higher = faster decay) |
 | `--collection` | all | Only process a specific collection |
 | `--qdrant-url` | `$QDRANT_URL` | Qdrant server URL |
 | `--qdrant-api-key` | `$QDRANT_API_KEY` | Qdrant API key |
 
-### Automating Cleanup with Cron
-
-```bash
-# Run cleanup monthly (dry-run example)
-0 0 1 * * /path/to/venv/bin/qdrant-cleanup --qdrant-url http://localhost:6333 --qdrant-api-key your_key
-```
-
 ## Prerequisites
 
-- **Ollama** with an embedding model (e.g. `embeddinggemma:300m`)
+- **Ollama** with an embedding model (e.g. `embeddinggemma:300m`) and optionally a summary model (e.g. `gemma3:4b`)
 - **Qdrant** vector database
 - **Python** 3.10+
-- **uv** (Python package manager)
+- **uv** (recommended Python package manager)
 
 ## Installation
-
-### Install from GitHub
 
 ```bash
 uv venv ~/mcp-qdrant-venv
@@ -147,11 +176,11 @@ source ~/mcp-qdrant-venv/bin/activate
 uv pip install git+https://github.com/user63047/mcp-server-qdrant.git
 ```
 
-This installs both commands:
+This installs two commands:
 - `mcp-server-qdrant` – The MCP server
-- `qdrant-cleanup` – The cleanup tool
+- `qdrant-cleanup` – The cleanup CLI tool
 
-### Update to Latest Version
+### Update
 
 ```bash
 source ~/mcp-qdrant-venv/bin/activate
@@ -162,38 +191,31 @@ uv pip install --upgrade git+https://github.com/user63047/mcp-server-qdrant.git
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `EMBEDDING_PROVIDER` | `fastembed` or `ollama` | `fastembed` |
-| `EMBEDDING_MODEL` | Model name | `sentence-transformers/all-MiniLM-L6-v2` |
-| `OLLAMA_URL` | Ollama API URL | `http://localhost:11434` |
-| `QDRANT_URL` | Qdrant API URL | None |
-| `QDRANT_API_KEY` | Qdrant API key (if enabled) | None |
-| `COLLECTION_NAME` | Default Qdrant collection | None |
+| Variable | Default | Description |
+|---|---|---|
+| `EMBEDDING_PROVIDER` | `fastembed` | `fastembed` or `ollama` |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model name |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama API URL |
+| `QDRANT_URL` | — | Qdrant server URL |
+| `QDRANT_API_KEY` | — | Qdrant API key (if authentication is enabled) |
+| `COLLECTION_NAME` | — | Default Qdrant collection |
+| `QDRANT_SEARCH_LIMIT` | `10` | Maximum search results |
+| `QDRANT_READ_ONLY` | `false` | Disable write operations |
+| `CHUNK_SIZE` | `1500` | Target chunk size in tokens |
+| `CHUNK_OVERLAP` | `375` | Overlap between chunks in tokens (25%) |
+| `SUMMARY_MODEL` | — | Ollama model for abstract generation (e.g. `gemma3:4b`). Disabled if not set. |
+| `SUMMARY_PROVIDER` | `ollama` | Summary provider |
 
-### Start Server Manually
-
-```bash
-EMBEDDING_PROVIDER=ollama \
-EMBEDDING_MODEL=embeddinggemma:300m \
-OLLAMA_URL=http://localhost:11434 \
-QDRANT_URL=http://localhost:6333 \
-QDRANT_API_KEY=your_api_key \
-COLLECTION_NAME=my-collection \
-mcp-server-qdrant
-```
-
-### MCP Client Integration (STDIO/JSON)
-
-For MCP clients like Msty Studio, Claude Desktop, or similar:
+### MCP Client Configuration
 
 ```json
 {
-  "command": "/path/to/mcp-qdrant-venv/bin/mcp-server-qdrant",
+  "command": "/path/to/venv/bin/mcp-server-qdrant",
   "args": [],
   "env": {
     "EMBEDDING_PROVIDER": "ollama",
     "EMBEDDING_MODEL": "embeddinggemma:300m",
+    "SUMMARY_MODEL": "gemma3:4b",
     "OLLAMA_URL": "http://localhost:11434",
     "QDRANT_URL": "http://localhost:6333",
     "QDRANT_API_KEY": "your_api_key",
@@ -205,67 +227,57 @@ For MCP clients like Msty Studio, Claude Desktop, or similar:
 ## Usage Examples
 
 ```
+# Store a document
+"Store in Qdrant with title 'Server Setup': 'Ubuntu 24.04 LTS with Docker and Nginx...'"
+
 # Store with metadata
-"Store in Qdrant: 'My server runs Ubuntu 24.04' with metadata category='infrastructure' and tags=['server', 'linux']"
+"Store with title 'Backup Strategy', category='infrastructure', tags=['backup', 'restic']"
 
 # Semantic search
-"Search in Qdrant for 'server operating system'"
+"Search in Qdrant for 'Docker networking configuration'"
 
-# List entries
-"List all entries in the Qdrant collection"
+# Append to existing document
+"Append to the document about backup strategy: 'Added weekly S3 sync...'"
 
-# Update content
-"Update the entry with category='infrastructure' to new text: 'My server runs Ubuntu 24.04 LTS with 64GB RAM'"
+# Update document
+"Update the document with title 'Server Setup' with new content: '...'"
 
 # Manage tags
-"Add the tag 'production' to entries with category='infrastructure'"
-"Remove the tag 'test' from entries with category='infrastructure'"
+"Add the tag 'production' to documents with category='infrastructure'"
 
-# Change metadata
-"Set the category to 'archived' for entries with category='old-project'"
-
-# Filter by content
-"Delete all entries containing 'test' in the content"
-
-# Combined filter
-"Add the tag 'important' to entries with category='infrastructure' that contain 'production' in the content"
+# Delete
+"Delete the document about old test configuration"
 ```
 
-## Changed Files (vs. Original)
+## Chunking Strategy
 
-| File | Change |
-|------|--------|
-| `src/mcp_server_qdrant/embeddings/ollama.py` | New – Ollama provider implementation |
-| `src/mcp_server_qdrant/embeddings/types.py` | Added OLLAMA enum |
-| `src/mcp_server_qdrant/embeddings/factory.py` | Ollama provider factory |
-| `src/mcp_server_qdrant/settings.py` | `ollama_url` setting + new tool descriptions |
-| `src/mcp_server_qdrant/qdrant.py` | CRUD methods + access tracking |
-| `src/mcp_server_qdrant/mcp_server.py` | New tools registered |
-| `src/mcp_server_qdrant/cleanup.py` | New – Cleanup CLI tool |
-| `pyproject.toml` | httpx dependency + cleanup entrypoint |
+The chunking algorithm uses a hybrid approach:
+
+1. If text ≤ `CHUNK_SIZE` tokens → single chunk
+2. Otherwise: advance to target size, search backwards for natural boundary
+   - Priority: paragraph (`\n\n`) → newline (`\n`) → sentence end (`. `) → word boundary
+3. Cut at boundary, start next chunk with `CHUNK_OVERLAP` overlap
+4. If no boundary found within 300 tokens → hard cut at target size
+
+This preserves semantic coherence across chunk boundaries while ensuring each chunk fits the embedding model's context window.
 
 ## Troubleshooting
 
-**Error: 401 Unauthorized**
-Qdrant has authentication enabled. Add `QDRANT_API_KEY` to your configuration.
+**Entries without document_id**
+If you have entries from a previous version (before the two-level architecture), they lack `document_id` and `chunk_index` fields. These will not work correctly with the new tools. Delete the old collection and re-index.
+
+**Empty abstracts**
+Ensure `SUMMARY_MODEL` is set and the model is available in Ollama (`ollama list`). Abstract generation is disabled if `SUMMARY_MODEL` is not configured.
 
 **Server starts without output**
-MCP servers communicate via stdio – this is normal. They wait for input from an MCP client.
-
-**Filter finds no entries**
-- Content filter uses substring search (`{"content": "server"}` finds "My server runs...")
-- Metadata filter uses exact match (`{"category": "homelab"}` only matches exactly "homelab")
-- Tags filter: `{"tags": ["docker"]}` finds entries that have "docker" in their tags array
-
-**Entries without tracking data**
-Entries created before the access tracking feature was added won't have `relevance_score` or `last_accessed_at`. The cleanup tool skips these entries by default.
+MCP servers communicate via stdio — this is normal. They wait for input from an MCP client.
 
 ## Acknowledgments
 
-This fork was developed with the assistance of [Claude Opus 4.6](https://www.anthropic.com/claude) by Anthropic.
+This fork was developed with the assistance of [Claude](https://www.anthropic.com/claude) by Anthropic.
 
 ## License
 
-Apache License 2.0 – see [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
 
 Original repo: [qdrant/mcp-server-qdrant](https://github.com/qdrant/mcp-server-qdrant)
