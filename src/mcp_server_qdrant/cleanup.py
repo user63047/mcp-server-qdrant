@@ -4,7 +4,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 
 
 def calculate_effective_score(relevance_score: float, days_since_access: float, decay_lambda: float) -> float:
@@ -17,23 +17,25 @@ def calculate_effective_score(relevance_score: float, days_since_access: float, 
 
 def main():
     """
-    Cleanup tool for Qdrant collections.
-    Calculates effective scores using exponential decay and removes
-    or reports entries below the threshold.
+    Cleanup tool for Qdrant collections (two-level document/chunk model).
+
+    Groups chunks by document_id and evaluates at the document level.
+    Only processes 'composed' entries — external sources are managed by
+    their respective sync pipelines.
     """
     parser = argparse.ArgumentParser(
-        description="Qdrant Cleanup - Remove entries with low relevance based on access tracking and time decay"
+        description="Qdrant Cleanup - Remove composed documents with low relevance based on access tracking and time decay"
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Only report entries that would be deleted, without actually deleting them",
+        help="Only report documents that would be deleted, without actually deleting them",
     )
     parser.add_argument(
         "--threshold",
         type=float,
         default=1.0,
-        help="Effective score below which entries are deleted (default: 1.0)",
+        help="Effective score below which documents are deleted (default: 1.0)",
     )
     parser.add_argument(
         "--decay-lambda",
@@ -86,22 +88,24 @@ def main():
     now = datetime.now(timezone.utc)
     total_deleted = 0
     total_kept = 0
-    total_no_tracking = 0
+    total_skipped_external = 0
 
     print(f"{'=' * 60}")
     print(f"Qdrant Cleanup {'(DRY RUN)' if args.dry_run else ''}")
     print(f"Threshold: {args.threshold} | Lambda: {args.decay_lambda}")
+    print(f"Mode: Document-level | Only source_type: composed")
     print(f"Date: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"{'=' * 60}")
 
     for collection_name in collection_names:
         print(f"\n--- Collection: {collection_name} ---")
 
-        # Scroll through all entries
+        # Scroll through all points, grouped by document_id.
+        # We only need chunk_index 0 per document for metadata,
+        # but we scroll all to count chunks.
         offset = None
-        entries_to_delete = []
-        entries_kept = 0
-        entries_no_tracking = 0
+        # doc_id -> {title, relevance_score, last_accessed_at, source_type, chunk_count}
+        documents: dict[str, dict] = {}
 
         while True:
             results, next_offset = client.scroll(
@@ -117,76 +121,115 @@ def main():
                 break
 
             for point in results:
-                metadata = point.payload.get("metadata", {})
-                relevance_score = metadata.get("relevance_score")
-                last_accessed_at = metadata.get("last_accessed_at")
+                payload = point.payload
+                doc_id = payload.get("document_id")
 
-                # Skip entries without access tracking
-                if relevance_score is None or last_accessed_at is None:
-                    entries_no_tracking += 1
+                if not doc_id:
+                    # Legacy point without document_id — skip
                     continue
 
-                # Calculate days since last access
-                try:
-                    last_access = datetime.fromisoformat(last_accessed_at)
-                    days_since_access = (now - last_access).total_seconds() / 86400
-                except (ValueError, TypeError):
-                    entries_no_tracking += 1
-                    continue
-
-                # Calculate effective score
-                effective_score = calculate_effective_score(
-                    relevance_score, days_since_access, args.decay_lambda
-                )
-
-                if effective_score < args.threshold:
-                    content_preview = point.payload.get("document", "")[:80]
-                    entries_to_delete.append({
-                        "id": point.id,
-                        "content_preview": content_preview,
-                        "relevance_score": relevance_score,
-                        "days_since_access": round(days_since_access, 1),
-                        "effective_score": round(effective_score, 2),
-                    })
+                if doc_id not in documents:
+                    metadata = payload.get("metadata", {})
+                    documents[doc_id] = {
+                        "title": payload.get("title", "(untitled)"),
+                        "source_type": metadata.get("source_type", "unknown"),
+                        "relevance_score": metadata.get("relevance_score"),
+                        "last_accessed_at": metadata.get("last_accessed_at"),
+                        "chunk_count": 1,
+                    }
                 else:
-                    entries_kept += 1
+                    documents[doc_id]["chunk_count"] += 1
 
             if next_offset is None:
                 break
             offset = next_offset
 
+        # Evaluate each document
+        docs_to_delete = []
+        docs_kept = 0
+        docs_external = 0
+
+        for doc_id, doc in documents.items():
+            # Only process composed entries
+            if doc["source_type"] != "composed":
+                docs_external += 1
+                continue
+
+            relevance_score = doc["relevance_score"]
+            last_accessed_at = doc["last_accessed_at"]
+
+            # Skip documents without access tracking
+            if relevance_score is None or last_accessed_at is None:
+                docs_kept += 1
+                continue
+
+            # Calculate days since last access
+            try:
+                last_access = datetime.fromisoformat(last_accessed_at)
+                days_since_access = (now - last_access).total_seconds() / 86400
+            except (ValueError, TypeError):
+                docs_kept += 1
+                continue
+
+            # Calculate effective score
+            effective_score = calculate_effective_score(
+                relevance_score, days_since_access, args.decay_lambda
+            )
+
+            if effective_score < args.threshold:
+                docs_to_delete.append({
+                    "document_id": doc_id,
+                    "title": doc["title"],
+                    "chunk_count": doc["chunk_count"],
+                    "relevance_score": relevance_score,
+                    "days_since_access": round(days_since_access, 1),
+                    "effective_score": round(effective_score, 2),
+                })
+            else:
+                docs_kept += 1
+
         # Report
-        if entries_to_delete:
-            print(f"\n  Entries below threshold ({args.threshold}):")
-            for entry in entries_to_delete:
+        if docs_to_delete:
+            print(f"\n  Documents below threshold ({args.threshold}):")
+            for doc in docs_to_delete:
                 print(
-                    f"    Score: {entry['relevance_score']} → {entry['effective_score']} "
-                    f"(after {entry['days_since_access']} days) | "
-                    f"\"{entry['content_preview']}...\""
+                    f"    [{doc['chunk_count']} chunk(s)] "
+                    f"Score: {doc['relevance_score']} → {doc['effective_score']} "
+                    f"(after {doc['days_since_access']} days) | "
+                    f"\"{doc['title']}\""
                 )
 
             if not args.dry_run:
-                ids_to_delete = [entry["id"] for entry in entries_to_delete]
-                client.delete(
-                    collection_name=collection_name,
-                    points_selector=ids_to_delete,
-                )
-                print(f"\n  ✓ Deleted {len(entries_to_delete)} entries")
+                for doc in docs_to_delete:
+                    # Delete all chunks of this document
+                    doc_filter = models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="document_id",
+                                match=models.MatchValue(value=doc["document_id"]),
+                            )
+                        ]
+                    )
+                    client.delete(
+                        collection_name=collection_name,
+                        points_selector=models.FilterSelector(filter=doc_filter),
+                    )
+                print(f"\n  ✓ Deleted {len(docs_to_delete)} document(s)")
             else:
-                print(f"\n  → Would delete {len(entries_to_delete)} entries")
+                print(f"\n  → Would delete {len(docs_to_delete)} document(s)")
         else:
-            print("  No entries below threshold.")
+            print("  No composed documents below threshold.")
 
-        print(f"  Kept: {entries_kept} | No tracking data: {entries_no_tracking}")
+        print(f"  Kept (composed): {docs_kept} | External (skipped): {docs_external}")
 
-        total_deleted += len(entries_to_delete)
-        total_kept += entries_kept
-        total_no_tracking += entries_no_tracking
+        total_deleted += len(docs_to_delete)
+        total_kept += docs_kept
+        total_skipped_external += docs_external
 
     # Summary
     print(f"\n{'=' * 60}")
     print(f"Summary:")
-    print(f"  {'Would delete' if args.dry_run else 'Deleted'}: {total_deleted}")
-    print(f"  Kept: {total_kept}")
-    print(f"  No tracking data: {total_no_tracking}")
+    print(f"  {'Would delete' if args.dry_run else 'Deleted'}: {total_deleted} document(s)")
+    print(f"  Kept (composed): {total_kept}")
+    print(f"  External (skipped): {total_skipped_external}")
     print(f"{'=' * 60}")

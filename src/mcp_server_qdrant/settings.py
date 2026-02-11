@@ -6,37 +6,71 @@ from pydantic_settings import BaseSettings
 from mcp_server_qdrant.embeddings.types import EmbeddingProviderType
 
 DEFAULT_TOOL_STORE_DESCRIPTION = (
-    "Keep the memory for later use, when you are asked to remember something."
+    "Store a document in Qdrant. Provide a title and the text content. "
+    "The text is automatically split into chunks for embedding. "
+    "Optionally provide metadata: category (str), tags (list[str]), "
+    "source_type ('composed' by default, or 'trilium', 'pdf', 'paperless'), "
+    "source_ref (URL/path to external source)."
 )
 DEFAULT_TOOL_FIND_DESCRIPTION = (
-    "Look up memories in Qdrant. Use this tool when you need to: \n"
-    " - Find memories by their content \n"
-    " - Access memories for further analysis \n"
-    " - Get some personal information about the user"
+    "Search for documents in Qdrant by semantic similarity. Returns document-level results "
+    "with title, abstract, and metadata. Use this tool when you need to: \n"
+    " - Find documents by their content \n"
+    " - Access knowledge for further analysis \n"
+    " - Get personal information about the user \n"
+    "Multiple chunks of the same document are grouped automatically."
 )
 DEFAULT_TOOL_DELETE_DESCRIPTION = (
-    "Delete memories from Qdrant based on filter criteria like category or tags."
+    "Delete a document and all its chunks from Qdrant. "
+    "Only works for 'composed' entries (source_type='composed'). "
+    "For external sources (trilium, pdf, etc.), delete at the source — "
+    "the sync will update Qdrant automatically. "
+    "If multiple documents match the filter, they are returned for disambiguation — "
+    "use document_id for exact targeting. "
+    "Filter by 'document_id', 'category', 'tags', or 'content'."
 )
 DEFAULT_TOOL_UPDATE_DESCRIPTION = (
-    "Replace the content of existing memories in Qdrant (creates new embeddings). "
-    "This REPLACES the entire content - if user wants to APPEND/ADD text, first use qdrant-find or qdrant-list "
-    "to get the existing content, then combine old + new text before updating. "
-    "Filter by metadata fields like 'category', 'tags', or 'source', or by 'content' for text search."
+    "Replace the entire content of a document in Qdrant (re-chunks and creates new embeddings). "
+    "Only works for 'composed' entries. For external sources, edit the source directly. "
+    "If you want to APPEND text, use qdrant-append instead. "
+    "If multiple documents match, they are returned for disambiguation — use document_id for exact targeting. "
+    "Filter by 'document_id', 'category', 'tags', or 'content'."
 )
 DEFAULT_TOOL_SET_METADATA_DESCRIPTION = (
-    "Update metadata of existing memories without changing the content or embeddings."
+    "Update metadata on documents without changing content or embeddings. "
+    "Works for ALL source types (composed, trilium, pdf, etc.). "
+    "Updates are applied to all chunks of the matching document(s). "
+    "Filter by 'document_id', 'category', 'tags', or 'content'."
 )
 DEFAULT_TOOL_LIST_DESCRIPTION = (
-    "List memories in a Qdrant collection, optionally filtered by metadata."
+    "List documents in a Qdrant collection, grouped by document. "
+    "Returns title, abstract, and metadata per document. "
+    "Optionally filter by metadata fields like 'category', 'tags', 'source_type'."
 )
 DEFAULT_TOOL_COLLECTIONS_DESCRIPTION = (
     "List all available collections in Qdrant."
 )
 DEFAULT_TOOL_ADD_TAGS_DESCRIPTION = (
-    "Add tags to existing memories without removing existing tags."
+    "Add tags to documents without removing existing tags. "
+    "Works for ALL source types. Updates all chunks of the matching document(s). "
+    "Filter by 'document_id', 'category', 'tags', or 'content'."
 )
 DEFAULT_TOOL_REMOVE_TAGS_DESCRIPTION = (
-    "Remove specific tags from existing memories."
+    "Remove specific tags from documents. "
+    "Works for ALL source types. Updates all chunks of the matching document(s). "
+    "Filter by 'document_id', 'category', 'tags', or 'content'."
+)
+DEFAULT_TOOL_APPEND_DESCRIPTION = (
+    "Append text to an existing document in Qdrant. The existing and new text are combined, "
+    "then the document is re-chunked and re-embedded. "
+    "Only works for 'composed' entries (full_content is stored in Qdrant). "
+    "For external sources (trilium, pdf, etc.), the full content is not available — "
+    "fetch it from the source via the appropriate MCP server, combine with the new text, "
+    "and use qdrant-update instead. "
+    "If the LLM has enriched content originally from an external source, "
+    "ask the user whether the enriched version should be written back to the source. "
+    "If multiple documents match, they are returned for disambiguation — use document_id for exact targeting. "
+    "Filter by 'document_id', 'category', 'tags', or 'content'."
 )
 
 METADATA_PATH = "metadata"
@@ -83,6 +117,10 @@ class ToolSettings(BaseSettings):
         default=DEFAULT_TOOL_REMOVE_TAGS_DESCRIPTION,
         validation_alias="TOOL_REMOVE_TAGS_DESCRIPTION",
     )
+    tool_append_description: str = Field(
+        default=DEFAULT_TOOL_APPEND_DESCRIPTION,
+        validation_alias="TOOL_APPEND_DESCRIPTION",
+    )
 
 
 class EmbeddingProviderSettings(BaseSettings):
@@ -124,6 +162,40 @@ class FilterableField(BaseModel):
     required: bool = Field(
         default=False,
         description="Whether the field is required for the filter.",
+    )
+
+
+class ChunkingSettings(BaseSettings):
+    """
+    Configuration for the chunking strategy.
+    """
+
+    chunk_size: int = Field(
+        default=1500,
+        validation_alias="CHUNK_SIZE",
+        description="Target chunk size in tokens",
+    )
+    chunk_overlap: int = Field(
+        default=375,
+        validation_alias="CHUNK_OVERLAP",
+        description="Overlap between chunks in tokens",
+    )
+
+
+class SummarySettings(BaseSettings):
+    """
+    Configuration for the summary/abstract generation.
+    """
+
+    summary_model: str | None = Field(
+        default=None,
+        validation_alias="SUMMARY_MODEL",
+        description="Ollama model for generating abstracts (e.g. 'gemma3:4b'). None disables summaries.",
+    )
+    summary_provider: str = Field(
+        default="ollama",
+        validation_alias="SUMMARY_PROVIDER",
+        description="Summary provider (currently only 'ollama')",
     )
 
 

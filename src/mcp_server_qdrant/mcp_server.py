@@ -11,27 +11,31 @@ from mcp_server_qdrant.common.func_tools import make_partial_function
 from mcp_server_qdrant.common.wrap_filters import wrap_filters
 from mcp_server_qdrant.embeddings.base import EmbeddingProvider
 from mcp_server_qdrant.embeddings.factory import create_embedding_provider
-from mcp_server_qdrant.qdrant import ArbitraryFilter, Entry, Metadata, QdrantConnector
+from mcp_server_qdrant.models import DocumentResult
+from mcp_server_qdrant.qdrant import ArbitraryFilter, Metadata, OperationResult, QdrantConnector
 from mcp_server_qdrant.settings import (
+    ChunkingSettings,
     EmbeddingProviderSettings,
     QdrantSettings,
+    SummarySettings,
     ToolSettings,
 )
+from mcp_server_qdrant.summary import SummaryProvider, create_summary_provider
 
 logger = logging.getLogger(__name__)
 
 
-# FastMCP is an alternative interface for declaring the capabilities
-# of the server. Its API is based on FastAPI.
 class QdrantMCPServer(FastMCP):
     """
-    A MCP server for Qdrant.
+    A MCP server for Qdrant using the two-level document/chunk architecture.
     """
 
     def __init__(
         self,
         tool_settings: ToolSettings,
         qdrant_settings: QdrantSettings,
+        chunking_settings: ChunkingSettings | None = None,
+        summary_settings: SummarySettings | None = None,
         embedding_provider_settings: Optional[EmbeddingProviderSettings] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
         name: str = "mcp-server-qdrant",
@@ -40,6 +44,8 @@ class QdrantMCPServer(FastMCP):
     ):
         self.tool_settings = tool_settings
         self.qdrant_settings = qdrant_settings
+        self.chunking_settings = chunking_settings or ChunkingSettings()
+        self.summary_settings = summary_settings or SummarySettings()
 
         if embedding_provider_settings and embedding_provider:
             raise ValueError(
@@ -65,6 +71,13 @@ class QdrantMCPServer(FastMCP):
 
         assert self.embedding_provider is not None, "Embedding provider is required"
 
+        # Create summary provider
+        self.summary_provider: SummaryProvider | None = None
+        if self.summary_settings.summary_model:
+            self.summary_provider = create_summary_provider(
+                self.summary_settings, self.embedding_provider_settings
+            )
+
         self.qdrant_connector = QdrantConnector(
             qdrant_settings.location,
             qdrant_settings.api_key,
@@ -72,49 +85,61 @@ class QdrantMCPServer(FastMCP):
             self.embedding_provider,
             qdrant_settings.local_path,
             make_indexes(qdrant_settings.filterable_fields_dict()),
+            chunking_settings=self.chunking_settings,
+            summary_provider=self.summary_provider,
         )
 
         super().__init__(name=name, instructions=instructions, **settings)
 
         self.setup_tools()
 
-    def format_entry(self, entry: Entry) -> str:
-        """
-        Feel free to override this method in your subclass to customize the format of the entry.
-        """
-        entry_metadata = json.dumps(entry.metadata) if entry.metadata else ""
-        return f"<entry><content>{entry.content}</content><metadata>{entry_metadata}</metadata></entry>"
+    def _format_document(self, doc: DocumentResult) -> str:
+        """Format a DocumentResult for LLM consumption."""
+        return doc.format_for_llm()
+
+    def _format_operation_result(self, result: OperationResult) -> str:
+        """Format an OperationResult for LLM consumption."""
+        parts = [result.message]
+        if result.documents:
+            parts.append("\nMatching documents:")
+            for doc in result.documents:
+                parts.append(doc.format_for_llm())
+        return "\n".join(parts)
 
     def setup_tools(self):
-        """
-        Register the tools in the server.
-        """
+        """Register the tools in the server."""
 
         # ===== STORE TOOL =====
         async def store(
             ctx: Context,
-            information: Annotated[str, Field(description="Text to store")],
+            title: Annotated[str, Field(description="Title of the document to store")],
+            information: Annotated[str, Field(description="Text content to store")],
             collection_name: Annotated[
-                str, Field(description="The collection to store the information in")
+                str, Field(description="The collection to store the document in")
             ],
             metadata: Annotated[
                 Metadata | None,
                 Field(
-                    description="Extra metadata stored along with memorised information. Any json is accepted."
+                    description=(
+                        "Optional metadata: category (str), tags (list[str]), "
+                        "source_type ('composed'|'trilium'|'pdf'|'paperless'), "
+                        "source_ref (url/path to external source). "
+                        "Default source_type is 'composed'."
+                    )
                 ),
             ] = None,
         ) -> str:
             """
-            Store some information in Qdrant.
+            Store a document in Qdrant. The text is automatically chunked if it
+            exceeds the embedding model's context window. An abstract is generated
+            if a summary model is configured.
             """
-            await ctx.debug(f"Storing information {information} in Qdrant")
+            await ctx.debug(f"Storing document '{title}' in Qdrant")
 
-            entry = Entry(content=information, metadata=metadata)
-
-            await self.qdrant_connector.store(entry, collection_name=collection_name)
-            if collection_name:
-                return f"Remembered: {information} in collection {collection_name}"
-            return f"Remembered: {information}"
+            result = await self.qdrant_connector.store(
+                title, information, metadata, collection_name=collection_name
+            )
+            return self._format_operation_result(result)
 
         # ===== FIND TOOL =====
         async def find(
@@ -126,27 +151,27 @@ class QdrantMCPServer(FastMCP):
             query_filter: ArbitraryFilter | None = None,
         ) -> list[str] | None:
             """
-            Find memories in Qdrant.
+            Find documents in Qdrant by semantic search. Returns document-level
+            results (title, abstract, metadata). Multiple chunks of the same
+            document are grouped automatically.
             """
             await ctx.debug(f"Query filter: {query_filter}")
 
             query_filter = models.Filter(**query_filter) if query_filter else None
 
-            await ctx.debug(f"Finding results for query {query}")
+            await ctx.debug(f"Finding results for query '{query}'")
 
-            entries = await self.qdrant_connector.search(
+            documents = await self.qdrant_connector.search(
                 query,
                 collection_name=collection_name,
                 limit=self.qdrant_settings.search_limit,
                 query_filter=query_filter,
             )
-            if not entries:
+            if not documents:
                 return None
-            content = [
-                f"Results for the query '{query}'",
-            ]
-            for entry in entries:
-                content.append(self.format_entry(entry))
+            content = [f"Results for the query '{query}'"]
+            for doc in documents:
+                content.append(self._format_document(doc))
             return content
 
         # ===== DELETE TOOL =====
@@ -156,18 +181,28 @@ class QdrantMCPServer(FastMCP):
                 str, Field(description="The collection to delete from")
             ],
             filter: Annotated[
-                dict, Field(description="Filter criteria (e.g. {'category': 'test'})")
+                dict,
+                Field(
+                    description=(
+                        "Filter to identify the document. Use 'document_id' for exact targeting, "
+                        "or metadata fields like 'category', 'tags'. "
+                        "Only 'composed' entries can be deleted; external sources must be deleted at the source."
+                    )
+                ),
             ],
         ) -> str:
             """
-            Delete entries matching the filter from Qdrant.
+            Delete a document and all its chunks from Qdrant.
+            Only works for 'composed' entries. For external sources (trilium, pdf, etc.),
+            delete at the source and the sync will update Qdrant.
+            If multiple documents match, returns them for disambiguation.
             """
-            await ctx.debug(f"Deleting entries with filter {filter} from {collection_name}")
+            await ctx.debug(f"Deleting document with filter {filter} from {collection_name}")
 
-            count = await self.qdrant_connector.delete(
+            result = await self.qdrant_connector.delete(
                 filter, collection_name=collection_name
             )
-            return f"Deleted {count} entries from {collection_name}"
+            return self._format_operation_result(result)
 
         # ===== UPDATE TOOL =====
         async def update(
@@ -176,24 +211,65 @@ class QdrantMCPServer(FastMCP):
                 str, Field(description="The collection to update")
             ],
             filter: Annotated[
-                dict, Field(description="Filter to identify entries to update")
+                dict,
+                Field(
+                    description=(
+                        "Filter to identify the document. Use 'document_id' for exact targeting, "
+                        "or metadata fields like 'category', 'tags', or 'content' for text search."
+                    )
+                ),
             ],
             new_information: Annotated[
-                str, Field(description="New content for the entries")
+                str, Field(description="New content that REPLACES the entire document")
             ],
             new_metadata: Annotated[
-                Metadata | None, Field(description="New metadata (optional)")
+                Metadata | None, Field(description="New metadata to merge with existing (optional)")
             ] = None,
         ) -> str:
             """
-            Update entries matching the filter with new content. This creates new embeddings.
+            Replace the content of an existing document. Creates new chunks and embeddings.
+            Only works for 'composed' entries. For external sources, edit the source directly.
+            If multiple documents match, returns them for disambiguation.
             """
-            await ctx.debug(f"Updating entries with filter {filter} in {collection_name}")
+            await ctx.debug(f"Updating document with filter {filter} in {collection_name}")
 
-            count = await self.qdrant_connector.update(
+            result = await self.qdrant_connector.update(
                 filter, new_information, new_metadata, collection_name=collection_name
             )
-            return f"Updated {count} entries in {collection_name}"
+            return self._format_operation_result(result)
+
+        # ===== APPEND TOOL =====
+        async def append(
+            ctx: Context,
+            collection_name: Annotated[
+                str, Field(description="The collection")
+            ],
+            filter: Annotated[
+                dict,
+                Field(
+                    description=(
+                        "Filter to identify the document. Use 'document_id' for exact targeting, "
+                        "or metadata fields like 'category', 'tags', or 'content' for text search."
+                    )
+                ),
+            ],
+            additional_text: Annotated[
+                str, Field(description="Text to append to the existing document")
+            ],
+        ) -> str:
+            """
+            Append text to an existing document. The existing and new text are combined,
+            then the document is re-chunked and re-embedded.
+            Only works for 'composed' entries. For external sources, the full content
+            is not stored in Qdrant — fetch it from the source, combine, and use qdrant-update.
+            If multiple documents match, returns them for disambiguation.
+            """
+            await ctx.debug(f"Appending to document with filter {filter} in {collection_name}")
+
+            result = await self.qdrant_connector.append(
+                filter, additional_text, collection_name=collection_name
+            )
+            return self._format_operation_result(result)
 
         # ===== SET METADATA TOOL =====
         async def set_metadata(
@@ -202,21 +278,22 @@ class QdrantMCPServer(FastMCP):
                 str, Field(description="The collection")
             ],
             filter: Annotated[
-                dict, Field(description="Filter to identify entries")
+                dict, Field(description="Filter to identify documents")
             ],
             metadata: Annotated[
-                dict, Field(description="Metadata fields to set/update")
+                dict, Field(description="Metadata fields to set/update (e.g. category, tags)")
             ],
         ) -> str:
             """
-            Set or update metadata on entries matching the filter without changing embeddings.
+            Set or update metadata on documents matching the filter without changing
+            content or embeddings. Works for ALL source types.
             """
-            await ctx.debug(f"Setting metadata on entries with filter {filter} in {collection_name}")
+            await ctx.debug(f"Setting metadata on documents with filter {filter} in {collection_name}")
 
-            count = await self.qdrant_connector.set_metadata(
+            result = await self.qdrant_connector.set_metadata(
                 filter, metadata, collection_name=collection_name
             )
-            return f"Updated metadata on {count} entries in {collection_name}"
+            return self._format_operation_result(result)
 
         # ===== ADD TAGS TOOL =====
         async def add_tags(
@@ -225,21 +302,22 @@ class QdrantMCPServer(FastMCP):
                 str, Field(description="The collection")
             ],
             filter: Annotated[
-                dict, Field(description="Filter to identify entries")
+                dict, Field(description="Filter to identify documents")
             ],
             tags: Annotated[
                 list[str], Field(description="Tags to add")
             ],
         ) -> str:
             """
-            Add tags to entries matching the filter without removing existing tags.
+            Add tags to documents matching the filter without removing existing tags.
+            Works for ALL source types.
             """
-            await ctx.debug(f"Adding tags {tags} to entries with filter {filter} in {collection_name}")
+            await ctx.debug(f"Adding tags {tags} to documents with filter {filter} in {collection_name}")
 
-            count = await self.qdrant_connector.add_tags(
+            result = await self.qdrant_connector.add_tags(
                 filter, tags, collection_name=collection_name
             )
-            return f"Added tags {tags} to {count} entries in {collection_name}"
+            return self._format_operation_result(result)
 
         # ===== REMOVE TAGS TOOL =====
         async def remove_tags(
@@ -248,21 +326,22 @@ class QdrantMCPServer(FastMCP):
                 str, Field(description="The collection")
             ],
             filter: Annotated[
-                dict, Field(description="Filter to identify entries")
+                dict, Field(description="Filter to identify documents")
             ],
             tags: Annotated[
                 list[str], Field(description="Tags to remove")
             ],
         ) -> str:
             """
-            Remove specific tags from entries matching the filter.
+            Remove specific tags from documents matching the filter.
+            Works for ALL source types.
             """
-            await ctx.debug(f"Removing tags {tags} from entries with filter {filter} in {collection_name}")
+            await ctx.debug(f"Removing tags {tags} from documents with filter {filter} in {collection_name}")
 
-            count = await self.qdrant_connector.remove_tags(
+            result = await self.qdrant_connector.remove_tags(
                 filter, tags, collection_name=collection_name
             )
-            return f"Removed tags {tags} from {count} entries in {collection_name}"
+            return self._format_operation_result(result)
 
         # ===== LIST TOOL =====
         async def list_entries(
@@ -271,27 +350,26 @@ class QdrantMCPServer(FastMCP):
                 str, Field(description="The collection to list")
             ],
             filter: Annotated[
-                dict | None, Field(description="Optional filter criteria")
+                dict | None, Field(description="Optional filter criteria (category, tags, source_type, ...)")
             ] = None,
             limit: Annotated[
-                int, Field(description="Maximum number of entries to return")
+                int, Field(description="Maximum number of documents to return")
             ] = 10,
         ) -> list[str] | None:
             """
-            List entries in a collection, optionally filtered by metadata.
+            List documents in a collection, grouped by document. Optionally filtered
+            by metadata fields. Returns title, abstract, and metadata per document.
             """
-            await ctx.debug(f"Listing entries from {collection_name} with filter {filter}")
+            await ctx.debug(f"Listing documents from {collection_name} with filter {filter}")
 
-            entries = await self.qdrant_connector.list_entries(
+            documents = await self.qdrant_connector.list_entries(
                 filter, limit=limit, collection_name=collection_name
             )
-            if not entries:
+            if not documents:
                 return None
-            content = [
-                f"Entries in collection '{collection_name}' (limit: {limit})",
-            ]
-            for entry in entries:
-                content.append(self.format_entry(entry))
+            content = [f"Documents in collection '{collection_name}' (limit: {limit})"]
+            for doc in documents:
+                content.append(self._format_document(doc))
             return content
 
         # ===== COLLECTIONS TOOL =====
@@ -307,12 +385,13 @@ class QdrantMCPServer(FastMCP):
             return [f"Available collections: {', '.join(names)}"]
 
         # ===== TOOL REGISTRATION =====
-        
+
         # Prepare function references
         find_foo = find
         store_foo = store
         delete_foo = delete
         update_foo = update
+        append_foo = append
         set_metadata_foo = set_metadata
         list_entries_foo = list_entries
         collections_foo = collections
@@ -342,6 +421,9 @@ class QdrantMCPServer(FastMCP):
             )
             update_foo = make_partial_function(
                 update_foo, {"collection_name": self.qdrant_settings.collection_name}
+            )
+            append_foo = make_partial_function(
+                append_foo, {"collection_name": self.qdrant_settings.collection_name}
             )
             set_metadata_foo = make_partial_function(
                 set_metadata_foo, {"collection_name": self.qdrant_settings.collection_name}
@@ -389,6 +471,11 @@ class QdrantMCPServer(FastMCP):
                 update_foo,
                 name="qdrant-update",
                 description=self.tool_settings.tool_update_description,
+            )
+            self.tool(
+                append_foo,
+                name="qdrant-append",
+                description=self.tool_settings.tool_append_description,
             )
             self.tool(
                 set_metadata_foo,

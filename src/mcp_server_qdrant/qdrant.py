@@ -6,43 +6,64 @@ from typing import Any
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient, models
 
+from mcp_server_qdrant.chunking import chunk_text
 from mcp_server_qdrant.embeddings.base import EmbeddingProvider
-from mcp_server_qdrant.settings import METADATA_PATH
+from mcp_server_qdrant.models import (
+    ChunkPayload,
+    ChunkWithId,
+    DocumentMetadata,
+    DocumentResult,
+    SourceType,
+    generate_document_id,
+)
+from mcp_server_qdrant.settings import ChunkingSettings, METADATA_PATH
+from mcp_server_qdrant.summary import SummaryProvider
 
 logger = logging.getLogger(__name__)
 
 Metadata = dict[str, Any]
 ArbitraryFilter = dict[str, Any]
 
+# --- Legacy models (kept for backward compatibility during transition) ---
+
 
 class Entry(BaseModel):
-    """
-    A single entry in the Qdrant collection.
-    """
+    """A single entry in the Qdrant collection. DEPRECATED: use models.DocumentResult."""
 
     content: str
     metadata: Metadata | None = None
 
 
 class EntryWithId(BaseModel):
-    """
-    A single entry in the Qdrant collection with its point ID.
-    """
+    """A single entry with its point ID. DEPRECATED: use models.ChunkWithId."""
 
     id: str
     content: str
     metadata: Metadata | None = None
 
 
+# --- Operation result for tools layer ---
+
+
+class OperationResult(BaseModel):
+    """Result of a write operation, supporting disambiguation."""
+
+    success: bool
+    message: str
+    count: int = 0
+    documents: list[DocumentResult] | None = None  # populated on disambiguation
+
+
+# --- Connector ---
+
+
 class QdrantConnector:
     """
-    Encapsulates the connection to a Qdrant server and all the methods to interact with it.
-    :param qdrant_url: The URL of the Qdrant server.
-    :param qdrant_api_key: The API key to use for the Qdrant server.
-    :param collection_name: The name of the default collection to use. If not provided, each tool will require
-                            the collection name to be provided.
-    :param embedding_provider: The embedding provider to use.
-    :param qdrant_local_path: The path to the storage directory for the Qdrant client, if local mode is used.
+    Encapsulates the connection to a Qdrant server using the two-level
+    document/chunk architecture.
+
+    Documents are split into chunks that fit the embedding model's context
+    window. All chunks share a document_id and carry redundant metadata.
     """
 
     def __init__(
@@ -53,6 +74,8 @@ class QdrantConnector:
         embedding_provider: EmbeddingProvider,
         qdrant_local_path: str | None = None,
         field_indexes: dict[str, models.PayloadSchemaType] | None = None,
+        chunking_settings: ChunkingSettings | None = None,
+        summary_provider: SummaryProvider | None = None,
     ):
         self._qdrant_url = qdrant_url.rstrip("/") if qdrant_url else None
         self._qdrant_api_key = qdrant_api_key
@@ -62,51 +85,111 @@ class QdrantConnector:
             location=qdrant_url, api_key=qdrant_api_key, path=qdrant_local_path
         )
         self._field_indexes = field_indexes
+        self._chunking_settings = chunking_settings or ChunkingSettings()
+        self._summary_provider = summary_provider
+
+    # =====================================================================
+    # Public API
+    # =====================================================================
 
     async def get_collection_names(self) -> list[str]:
-        """
-        Get the names of all collections in the Qdrant server.
-        :return: A list of collection names.
-        """
+        """Get the names of all collections in the Qdrant server."""
         response = await self._client.get_collections()
         return [collection.name for collection in response.collections]
 
-    async def store(self, entry: Entry, *, collection_name: str | None = None):
+    # ----- store ---------------------------------------------------------
+
+    async def store(
+        self,
+        title: str,
+        content: str,
+        metadata: Metadata | None = None,
+        *,
+        collection_name: str | None = None,
+    ) -> OperationResult:
         """
-        Store some information in the Qdrant collection, along with the specified metadata.
-        :param entry: The entry to store in the Qdrant collection.
-        :param collection_name: The name of the collection to store the information in, optional. If not provided,
-                                the default collection is used.
+        Store a document: generate abstract, chunk text, embed each chunk,
+        and write all points with a shared document_id.
+
+        :param title: Document title.
+        :param content: Full document text.
+        :param metadata: Optional metadata dict (category, tags, source_type, source_ref, ...).
+        :param collection_name: Target collection (uses default if None).
+        :return: OperationResult with success info.
         """
         collection_name = collection_name or self._default_collection_name
         assert collection_name is not None
         await self._ensure_collection_exists(collection_name)
 
-        # Embed the document
-        embeddings = await self._embedding_provider.embed_documents([entry.content])
+        meta = metadata or {}
+        now = datetime.now(timezone.utc).isoformat()
+        source_type = meta.get("source_type", SourceType.COMPOSED)
 
-        # Add created_at timestamp if not present
-        metadata = entry.metadata or {}
-        if "created_at" not in metadata:
-            metadata["created_at"] = datetime.now(timezone.utc).isoformat()
+        # Build DocumentMetadata
+        doc_meta = DocumentMetadata(
+            source_type=source_type,
+            source_ref=meta.get("source_ref"),
+            category=meta.get("category"),
+            tags=meta.get("tags", []),
+            created_at=now,
+            updated_at=None,
+            relevance_score=0,
+            last_accessed_at=now,
+        )
 
-        # Initialize access tracking
-        metadata["relevance_score"] = 0
-        metadata["last_accessed_at"] = metadata["created_at"]
+        # Generate abstract
+        abstract = None
+        if self._summary_provider and self._summary_provider.enabled:
+            abstract = await self._summary_provider.generate_abstract(content, title)
 
-        # Add to Qdrant
+        # Chunk the content
+        chunks = chunk_text(content, self._chunking_settings)
+        if not chunks:
+            return OperationResult(success=False, message="Empty content, nothing to store.")
+
+        doc_id = generate_document_id()
+
+        # Embed all chunks
+        embeddings = await self._embedding_provider.embed_documents(chunks)
         vector_name = self._embedding_provider.get_vector_name()
-        payload = {"document": entry.content, METADATA_PATH: metadata}
-        await self._client.upsert(
-            collection_name=collection_name,
-            points=[
+
+        # Build points
+        points = []
+        for i, (chunk_text_content, embedding) in enumerate(zip(chunks, embeddings)):
+            payload: dict[str, Any] = {
+                "document": chunk_text_content,
+                "document_id": doc_id,
+                "title": title,
+                "chunk_index": i,
+                METADATA_PATH: doc_meta.model_dump(),
+            }
+            if abstract is not None:
+                payload["abstract"] = abstract
+            # full_content only on chunk 0 for composed entries
+            if i == 0 and source_type == SourceType.COMPOSED:
+                payload["full_content"] = content
+
+            points.append(
                 models.PointStruct(
                     id=uuid.uuid4().hex,
-                    vector={vector_name: embeddings[0]},
+                    vector={vector_name: embedding},
                     payload=payload,
                 )
-            ],
+            )
+
+        await self._client.upsert(collection_name=collection_name, points=points)
+
+        logger.info(
+            "Stored document '%s' (%s) with %d chunk(s) in '%s'",
+            title, doc_id, len(chunks), collection_name,
         )
+        return OperationResult(
+            success=True,
+            message=f"Stored document '{title}' with {len(chunks)} chunk(s).",
+            count=len(chunks),
+        )
+
+    # ----- search / find -------------------------------------------------
 
     async def search(
         self,
@@ -115,16 +198,16 @@ class QdrantConnector:
         collection_name: str | None = None,
         limit: int = 10,
         query_filter: models.Filter | None = None,
-    ) -> list[Entry]:
+    ) -> list[DocumentResult]:
         """
-        Find points in the Qdrant collection. If there are no entries found, an empty list is returned.
-        :param query: The query to use for the search.
-        :param collection_name: The name of the collection to search in, optional. If not provided,
-                                the default collection is used.
-        :param limit: The maximum number of entries to return.
-        :param query_filter: The filter to apply to the query, if any.
+        Search for documents. Returns deduplicated document-level results
+        grouped by document_id.
 
-        :return: A list of entries found.
+        :param query: Search query text.
+        :param collection_name: Collection to search.
+        :param limit: Max number of chunk hits (documents returned may be fewer).
+        :param query_filter: Optional Qdrant filter.
+        :return: List of DocumentResult.
         """
         collection_name = collection_name or self._default_collection_name
         collection_exists = await self._client.collection_exists(collection_name)
@@ -134,7 +217,6 @@ class QdrantConnector:
         query_vector = await self._embedding_provider.embed_query(query)
         vector_name = self._embedding_provider.get_vector_name()
 
-        # Search in Qdrant
         search_results = await self._client.query_points(
             collection_name=collection_name,
             query=query_vector,
@@ -143,51 +225,132 @@ class QdrantConnector:
             query_filter=query_filter,
         )
 
-        # Update access tracking for found entries (find = +3)
-        point_ids = [result.id for result in search_results.points]
-        await self._update_access_tracking(collection_name, point_ids, score_increment=3)
+        if not search_results.points:
+            return []
 
-        return [
-            Entry(
-                content=result.payload["document"],
-                metadata=result.payload.get("metadata"),
-            )
-            for result in search_results.points
-        ]
+        # Group by document_id and deduplicate
+        documents = self._group_points_to_documents(search_results.points)
+
+        # Access tracking: update all chunks of found documents (find = +3)
+        all_doc_ids = [doc.document_id for doc in documents]
+        await self._update_access_tracking_by_document_ids(
+            collection_name, all_doc_ids, score_increment=3
+        )
+
+        return documents
+
+    # ----- list ----------------------------------------------------------
+
+    async def list_entries(
+        self,
+        filter_dict: dict | None = None,
+        limit: int = 10,
+        *,
+        collection_name: str | None = None,
+    ) -> list[DocumentResult]:
+        """
+        List documents in a collection, grouped by document_id.
+
+        :param filter_dict: Optional filter criteria.
+        :param limit: Max number of documents to return.
+        :param collection_name: Collection to list from.
+        :return: List of DocumentResult.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return []
+
+        qdrant_filter = self._build_filter(filter_dict) if filter_dict else None
+
+        # Scroll enough chunks to find `limit` distinct documents
+        # Over-fetch to account for multi-chunk documents
+        fetch_limit = limit * 5
+        results, _ = await self._client.scroll(
+            collection_name=collection_name,
+            scroll_filter=qdrant_filter,
+            limit=fetch_limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        if not results:
+            return []
+
+        documents = self._group_points_to_documents(results)[:limit]
+
+        # Access tracking (list = +1)
+        all_doc_ids = [doc.document_id for doc in documents]
+        await self._update_access_tracking_by_document_ids(
+            collection_name, all_doc_ids, score_increment=1
+        )
+
+        return documents
+
+    # ----- delete --------------------------------------------------------
 
     async def delete(
         self,
         filter_dict: dict,
         *,
         collection_name: str | None = None,
-    ) -> int:
+    ) -> OperationResult:
         """
-        Delete entries based on a filter.
-        :param filter_dict: The filter criteria (e.g. {"category": "test"}).
-        :param collection_name: The name of the collection to delete from.
-        :return: Number of deleted entries (estimated).
+        Delete documents matching the filter. Only composed entries can be
+        deleted; external sources return a redirect message.
+        Disambiguates if multiple documents match.
+
+        :param filter_dict: Filter criteria.
+        :param collection_name: Collection to delete from.
+        :return: OperationResult (may contain disambiguation documents).
         """
         collection_name = collection_name or self._default_collection_name
         assert collection_name is not None
-        
+
         collection_exists = await self._client.collection_exists(collection_name)
         if not collection_exists:
-            return 0
+            return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        qdrant_filter = self._build_filter(filter_dict)
-        if not qdrant_filter:
-            return 0
+        doc_map = await self._resolve_documents(filter_dict, collection_name)
 
-        # Count entries before deletion (for return value)
-        count_before = await self._count_by_filter(collection_name, qdrant_filter)
+        if not doc_map:
+            return OperationResult(success=False, message="No matching documents found.", count=0)
 
-        # Delete entries matching the filter
-        await self._client.delete(
-            collection_name=collection_name,
-            points_selector=models.FilterSelector(filter=qdrant_filter),
+        # Disambiguation: multiple documents matched
+        if len(doc_map) > 1:
+            docs = list(doc_map.values())
+            return OperationResult(
+                success=False,
+                message=f"Multiple documents matched ({len(docs)}). Please specify which one by document_id.",
+                documents=docs,
+            )
+
+        doc_id, doc_result = next(iter(doc_map.items()))
+
+        # Source type check
+        if doc_result.metadata.source_type != SourceType.COMPOSED:
+            return OperationResult(
+                success=False,
+                message=(
+                    f"Cannot delete '{doc_result.title}' — it is a '{doc_result.metadata.source_type}' entry "
+                    f"(source: {doc_result.metadata.source_ref}). "
+                    f"Delete it at the source; the sync will update Qdrant automatically."
+                ),
+                documents=[doc_result],
+            )
+
+        # Delete all chunks of this document
+        await self._delete_all_chunks(collection_name, doc_id)
+
+        return OperationResult(
+            success=True,
+            message=f"Deleted document '{doc_result.title}' ({doc_result.chunk_count} chunk(s)).",
+            count=1,
         )
 
-        return count_before
+    # ----- update --------------------------------------------------------
 
     async def update(
         self,
@@ -196,72 +359,176 @@ class QdrantConnector:
         new_metadata: Metadata | None = None,
         *,
         collection_name: str | None = None,
-    ) -> int:
+    ) -> OperationResult:
         """
-        Update entries matching the filter with new content (creates new embeddings).
-        :param filter_dict: The filter criteria to identify entries.
-        :param new_content: The new text content.
-        :param new_metadata: New metadata to merge with existing (optional).
-        :param collection_name: The name of the collection.
-        :return: Number of updated entries.
+        Replace the content of a document: delete old chunks, re-chunk,
+        re-embed, generate new abstract. Only for composed entries.
+
+        :param filter_dict: Filter to identify the document.
+        :param new_content: Replacement text.
+        :param new_metadata: Optional metadata updates (merged with existing).
+        :param collection_name: Collection.
+        :return: OperationResult.
         """
         collection_name = collection_name or self._default_collection_name
         assert collection_name is not None
-        
+
         collection_exists = await self._client.collection_exists(collection_name)
         if not collection_exists:
-            return 0
+            return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        qdrant_filter = self._build_filter(filter_dict)
-        if not qdrant_filter:
-            return 0
+        doc_map = await self._resolve_documents(filter_dict, collection_name)
 
-        # Find existing entries to preserve metadata
-        existing_entries = await self._scroll_entries(collection_name, qdrant_filter, limit=100)
-        if not existing_entries:
-            return 0
+        if not doc_map:
+            return OperationResult(success=False, message="No matching documents found.", count=0)
 
-        # Delete old entries
-        await self._client.delete(
-            collection_name=collection_name,
-            points_selector=models.FilterSelector(filter=qdrant_filter),
-        )
+        if len(doc_map) > 1:
+            docs = list(doc_map.values())
+            return OperationResult(
+                success=False,
+                message=f"Multiple documents matched ({len(docs)}). Please specify which one by document_id.",
+                documents=docs,
+            )
 
-        # Create new embedding
-        embeddings = await self._embedding_provider.embed_documents([new_content])
+        doc_id, doc_result = next(iter(doc_map.items()))
+
+        if doc_result.metadata.source_type != SourceType.COMPOSED:
+            return OperationResult(
+                success=False,
+                message=(
+                    f"Cannot update '{doc_result.title}' — it is a '{doc_result.metadata.source_type}' entry "
+                    f"(source: {doc_result.metadata.source_ref}). "
+                    f"Edit the source directly; the sync will update Qdrant."
+                ),
+                documents=[doc_result],
+            )
+
+        # Preserve existing metadata, merge with new
+        existing_meta = doc_result.metadata.model_dump()
+        if new_metadata:
+            existing_meta.update(new_metadata)
+
+        now = datetime.now(timezone.utc).isoformat()
+        existing_meta["updated_at"] = now
+        existing_meta["relevance_score"] = doc_result.metadata.relevance_score + 2  # update = +2
+        existing_meta["last_accessed_at"] = now
+
+        # Delete old chunks
+        await self._delete_all_chunks(collection_name, doc_id)
+
+        # Generate new abstract
+        abstract = None
+        if self._summary_provider and self._summary_provider.enabled:
+            abstract = await self._summary_provider.generate_abstract(new_content, doc_result.title)
+
+        # Re-chunk and re-embed
+        chunks = chunk_text(new_content, self._chunking_settings)
+        if not chunks:
+            return OperationResult(success=False, message="New content is empty.", count=0)
+
+        embeddings = await self._embedding_provider.embed_documents(chunks)
         vector_name = self._embedding_provider.get_vector_name()
 
-        # Preserve old metadata and merge with new
-        old_metadata = existing_entries[0].metadata or {}
-        metadata = old_metadata.copy()
-        
-        # Merge new metadata if provided (overwrites existing keys)
-        if new_metadata:
-            metadata.update(new_metadata)
-        
-        # Always update the updated_at timestamp
-        now = datetime.now(timezone.utc).isoformat()
-        metadata["updated_at"] = now
+        doc_meta = DocumentMetadata(**existing_meta)
 
-        # Update access tracking (update = +2)
-        current_score = metadata.get("relevance_score", 0)
-        metadata["relevance_score"] = current_score + 2
-        metadata["last_accessed_at"] = now
+        points = []
+        for i, (chunk_text_content, embedding) in enumerate(zip(chunks, embeddings)):
+            payload: dict[str, Any] = {
+                "document": chunk_text_content,
+                "document_id": doc_id,
+                "title": doc_result.title,
+                "chunk_index": i,
+                METADATA_PATH: doc_meta.model_dump(),
+            }
+            if abstract is not None:
+                payload["abstract"] = abstract
+            if i == 0:
+                payload["full_content"] = new_content
 
-        # Store new entry
-        payload = {"document": new_content, METADATA_PATH: metadata}
-        await self._client.upsert(
-            collection_name=collection_name,
-            points=[
+            points.append(
                 models.PointStruct(
                     id=uuid.uuid4().hex,
-                    vector={vector_name: embeddings[0]},
+                    vector={vector_name: embedding},
                     payload=payload,
                 )
-            ],
+            )
+
+        await self._client.upsert(collection_name=collection_name, points=points)
+
+        return OperationResult(
+            success=True,
+            message=f"Updated document '{doc_result.title}' with {len(chunks)} chunk(s).",
+            count=1,
         )
 
-        return len(existing_entries)
+    # ----- append --------------------------------------------------------
+
+    async def append(
+        self,
+        filter_dict: dict,
+        additional_content: str,
+        *,
+        collection_name: str | None = None,
+    ) -> OperationResult:
+        """
+        Append text to an existing composed document. Fetches full_content
+        from chunk 0, combines with new text, then re-chunks.
+
+        :param filter_dict: Filter to identify the document.
+        :param additional_content: Text to append.
+        :param collection_name: Collection.
+        :return: OperationResult.
+        """
+        collection_name = collection_name or self._default_collection_name
+        assert collection_name is not None
+
+        collection_exists = await self._client.collection_exists(collection_name)
+        if not collection_exists:
+            return OperationResult(success=False, message="Collection does not exist.", count=0)
+
+        doc_map = await self._resolve_documents(filter_dict, collection_name)
+
+        if not doc_map:
+            return OperationResult(success=False, message="No matching documents found.", count=0)
+
+        if len(doc_map) > 1:
+            docs = list(doc_map.values())
+            return OperationResult(
+                success=False,
+                message=f"Multiple documents matched ({len(docs)}). Please specify which one by document_id.",
+                documents=docs,
+            )
+
+        doc_id, doc_result = next(iter(doc_map.items()))
+
+        if doc_result.metadata.source_type != SourceType.COMPOSED:
+            return OperationResult(
+                success=False,
+                message=(
+                    f"Cannot append to '{doc_result.title}' — it is a '{doc_result.metadata.source_type}' entry "
+                    f"(source: {doc_result.metadata.source_ref}). "
+                    f"No full_content available. Fetch the full text from the source and use qdrant-update instead."
+                ),
+                documents=[doc_result],
+            )
+
+        # Get full_content from chunk_index 0
+        full_content = await self._get_full_content(collection_name, doc_id)
+        if full_content is None:
+            return OperationResult(
+                success=False,
+                message=f"Could not retrieve full_content for document '{doc_result.title}'.",
+            )
+
+        # Combine and re-store via update
+        combined_content = full_content + "\n\n" + additional_content
+        return await self.update(
+            {"document_id": doc_id},
+            combined_content,
+            collection_name=collection_name,
+        )
+
+    # ----- set_metadata --------------------------------------------------
 
     async def set_metadata(
         self,
@@ -269,48 +536,53 @@ class QdrantConnector:
         metadata: Metadata,
         *,
         collection_name: str | None = None,
-    ) -> int:
+    ) -> OperationResult:
         """
-        Set/update metadata on entries matching the filter without creating new embeddings.
-        :param filter_dict: The filter criteria to identify entries.
-        :param metadata: The metadata fields to set/update.
-        :param collection_name: The name of the collection.
-        :return: Number of updated entries.
+        Update metadata on all chunks of matching documents.
+        Allowed for ALL source types.
+
+        :param filter_dict: Filter to identify documents.
+        :param metadata: Metadata fields to set/update.
+        :param collection_name: Collection.
+        :return: OperationResult.
         """
         collection_name = collection_name or self._default_collection_name
         assert collection_name is not None
-        
+
         collection_exists = await self._client.collection_exists(collection_name)
         if not collection_exists:
-            return 0
+            return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        qdrant_filter = self._build_filter(filter_dict)
-        if not qdrant_filter:
-            return 0
+        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        if not doc_map:
+            return OperationResult(success=False, message="No matching documents found.", count=0)
 
-        # Get entries with IDs so we can update them properly
-        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit=100)
-        if not entries_with_ids:
-            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        metadata["updated_at"] = now
+        updated_count = 0
 
-        # Add updated_at timestamp
-        metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+        for doc_id, doc_result in doc_map.items():
+            # Get all chunks for this document
+            chunks = await self._get_all_chunks(collection_name, doc_id)
+            for chunk in chunks:
+                existing_meta = chunk.payload.get(METADATA_PATH, {})
+                updated_meta = existing_meta.copy()
+                updated_meta.update(metadata)
 
-        # Update each entry's metadata properly
-        for entry in entries_with_ids:
-            # Merge existing metadata with new metadata
-            existing_metadata = entry.metadata or {}
-            updated_metadata = existing_metadata.copy()
-            updated_metadata.update(metadata)
-            
-            # Overwrite the entire metadata object
-            await self._client.set_payload(
-                collection_name=collection_name,
-                payload={METADATA_PATH: updated_metadata},
-                points=[entry.id],
-            )
+                await self._client.set_payload(
+                    collection_name=collection_name,
+                    payload={METADATA_PATH: updated_meta},
+                    points=[chunk.id],
+                )
+            updated_count += 1
 
-        return len(entries_with_ids)
+        return OperationResult(
+            success=True,
+            message=f"Updated metadata on {updated_count} document(s).",
+            count=updated_count,
+        )
+
+    # ----- add_tags ------------------------------------------------------
 
     async def add_tags(
         self,
@@ -318,50 +590,50 @@ class QdrantConnector:
         tags: list[str],
         *,
         collection_name: str | None = None,
-    ) -> int:
+    ) -> OperationResult:
         """
-        Add tags to entries matching the filter without removing existing tags.
-        :param filter_dict: The filter criteria to identify entries.
-        :param tags: The tags to add.
-        :param collection_name: The name of the collection.
-        :return: Number of updated entries.
+        Add tags to all chunks of matching documents.
+        Allowed for ALL source types.
         """
         collection_name = collection_name or self._default_collection_name
         assert collection_name is not None
-        
+
         collection_exists = await self._client.collection_exists(collection_name)
         if not collection_exists:
-            return 0
+            return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        qdrant_filter = self._build_filter(filter_dict)
-        if not qdrant_filter:
-            return 0
+        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        if not doc_map:
+            return OperationResult(success=False, message="No matching documents found.", count=0)
 
-        # Get entries with IDs so we can update them properly
-        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit=100)
-        if not entries_with_ids:
-            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        updated_count = 0
 
-        # Update each entry's tags
-        for entry in entries_with_ids:
-            existing_metadata = entry.metadata or {}
-            existing_tags = existing_metadata.get("tags", [])
-            
-            # Merge tags (avoid duplicates)
-            merged_tags = list(set(existing_tags + tags))
-            
-            # Update metadata
-            updated_metadata = existing_metadata.copy()
-            updated_metadata["tags"] = merged_tags
-            updated_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
-            
-            await self._client.set_payload(
-                collection_name=collection_name,
-                payload={METADATA_PATH: updated_metadata},
-                points=[entry.id],
-            )
+        for doc_id in doc_map:
+            chunks = await self._get_all_chunks(collection_name, doc_id)
+            for chunk in chunks:
+                existing_meta = chunk.payload.get(METADATA_PATH, {})
+                existing_tags = existing_meta.get("tags", [])
+                merged_tags = list(set(existing_tags + tags))
 
-        return len(entries_with_ids)
+                updated_meta = existing_meta.copy()
+                updated_meta["tags"] = merged_tags
+                updated_meta["updated_at"] = now
+
+                await self._client.set_payload(
+                    collection_name=collection_name,
+                    payload={METADATA_PATH: updated_meta},
+                    points=[chunk.id],
+                )
+            updated_count += 1
+
+        return OperationResult(
+            success=True,
+            message=f"Added tags {tags} to {updated_count} document(s).",
+            count=updated_count,
+        )
+
+    # ----- remove_tags ---------------------------------------------------
 
     async def remove_tags(
         self,
@@ -369,240 +641,283 @@ class QdrantConnector:
         tags: list[str],
         *,
         collection_name: str | None = None,
-    ) -> int:
+    ) -> OperationResult:
         """
-        Remove specific tags from entries matching the filter.
-        :param filter_dict: The filter criteria to identify entries.
-        :param tags: The tags to remove.
-        :param collection_name: The name of the collection.
-        :return: Number of updated entries.
+        Remove tags from all chunks of matching documents.
+        Allowed for ALL source types.
         """
         collection_name = collection_name or self._default_collection_name
         assert collection_name is not None
-        
+
         collection_exists = await self._client.collection_exists(collection_name)
         if not collection_exists:
-            return 0
+            return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        qdrant_filter = self._build_filter(filter_dict)
-        if not qdrant_filter:
-            return 0
+        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        if not doc_map:
+            return OperationResult(success=False, message="No matching documents found.", count=0)
 
-        # Get entries with IDs so we can update them properly
-        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit=100)
-        if not entries_with_ids:
-            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        updated_count = 0
 
-        # Update each entry's tags
-        for entry in entries_with_ids:
-            existing_metadata = entry.metadata or {}
-            existing_tags = existing_metadata.get("tags", [])
-            
-            # Remove specified tags
-            filtered_tags = [t for t in existing_tags if t not in tags]
-            
-            # Update metadata
-            updated_metadata = existing_metadata.copy()
-            updated_metadata["tags"] = filtered_tags
-            updated_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
-            
-            await self._client.set_payload(
-                collection_name=collection_name,
-                payload={METADATA_PATH: updated_metadata},
-                points=[entry.id],
-            )
+        for doc_id in doc_map:
+            chunks = await self._get_all_chunks(collection_name, doc_id)
+            for chunk in chunks:
+                existing_meta = chunk.payload.get(METADATA_PATH, {})
+                existing_tags = existing_meta.get("tags", [])
+                filtered_tags = [t for t in existing_tags if t not in tags]
 
-        return len(entries_with_ids)
+                updated_meta = existing_meta.copy()
+                updated_meta["tags"] = filtered_tags
+                updated_meta["updated_at"] = now
 
-    async def list_entries(
-        self,
-        filter_dict: dict | None = None,
-        limit: int = 10,
-        *,
-        collection_name: str | None = None,
-    ) -> list[Entry]:
-        """
-        List entries in a collection, optionally filtered.
-        :param filter_dict: Optional filter criteria.
-        :param limit: Maximum number of entries to return.
-        :param collection_name: The name of the collection.
-        :return: List of entries.
-        """
-        collection_name = collection_name or self._default_collection_name
-        assert collection_name is not None
-        
-        collection_exists = await self._client.collection_exists(collection_name)
-        if not collection_exists:
-            return []
+                await self._client.set_payload(
+                    collection_name=collection_name,
+                    payload={METADATA_PATH: updated_meta},
+                    points=[chunk.id],
+                )
+            updated_count += 1
 
-        qdrant_filter = self._build_filter(filter_dict) if filter_dict else None
+        return OperationResult(
+            success=True,
+            message=f"Removed tags {tags} from {updated_count} document(s).",
+            count=updated_count,
+        )
 
-        # Use scroll with IDs to enable access tracking
-        entries_with_ids = await self._scroll_entries_with_ids(collection_name, qdrant_filter, limit)
-        if not entries_with_ids:
-            return []
-
-        # Update access tracking for listed entries (list = +1)
-        point_ids = [entry.id for entry in entries_with_ids]
-        await self._update_access_tracking(collection_name, point_ids, score_increment=1)
-
-        return [
-            Entry(content=entry.content, metadata=entry.metadata)
-            for entry in entries_with_ids
-        ]
+    # =====================================================================
+    # Internal helpers
+    # =====================================================================
 
     def _build_filter(self, filter_dict: dict) -> models.Filter | None:
         """
         Convert a simple dict into a Qdrant Filter.
-        
+
         Supports:
-        - Metadata fields: {"category": "homelab"} -> exact match
-        - Content field: {"content": "text"} -> substring/text match
-        
-        Multiple conditions are combined with AND.
-        
-        Input:  {"category": "homelab", "content": "server"}
-        Output: models.Filter with must-conditions
+        - Top-level fields: document_id, title
+        - Content field: content/document → text match on 'document'
+        - Metadata fields: everything else → metadata.{key}
         """
         if not filter_dict:
             return None
-            
+
         conditions = []
         for key, value in filter_dict.items():
-            # Handle content/document field with text match (substring search)
-            if key in ("content", "document"):
+            # Top-level exact-match fields
+            if key == "document_id":
+                conditions.append(
+                    models.FieldCondition(
+                        key="document_id",
+                        match=models.MatchValue(value=value),
+                    )
+                )
+            elif key == "title":
+                conditions.append(
+                    models.FieldCondition(
+                        key="title",
+                        match=models.MatchText(text=value),
+                    )
+                )
+            elif key in ("content", "document"):
                 if isinstance(value, str):
                     conditions.append(
                         models.FieldCondition(
                             key="document",
-                            match=models.MatchText(text=value)
+                            match=models.MatchText(text=value),
                         )
                     )
-            # Handle metadata fields with exact match
             else:
-                field_key = key if key.startswith(f"{METADATA_PATH}.") else f"{METADATA_PATH}.{key}"
-                
+                # Metadata fields
+                field_key = (
+                    key
+                    if key.startswith(f"{METADATA_PATH}.")
+                    else f"{METADATA_PATH}.{key}"
+                )
                 if isinstance(value, list):
-                    # Match any of the values
                     conditions.append(
                         models.FieldCondition(
                             key=field_key,
-                            match=models.MatchAny(any=value)
+                            match=models.MatchAny(any=value),
                         )
                     )
                 else:
-                    # Exact match
                     conditions.append(
                         models.FieldCondition(
                             key=field_key,
-                            match=models.MatchValue(value=value)
+                            match=models.MatchValue(value=value),
                         )
                     )
-        
+
         return models.Filter(must=conditions) if conditions else None
 
-    async def _scroll_entries(
+    async def _resolve_documents(
         self,
+        filter_dict: dict,
         collection_name: str,
-        qdrant_filter: models.Filter | None,
-        limit: int,
-    ) -> list[Entry]:
+    ) -> dict[str, DocumentResult]:
         """
-        Scroll through entries in a collection.
+        Find all documents matching a filter. Returns a dict of
+        document_id → DocumentResult.
         """
+        qdrant_filter = self._build_filter(filter_dict)
+        if not qdrant_filter:
+            return {}
+
         results, _ = await self._client.scroll(
             collection_name=collection_name,
             scroll_filter=qdrant_filter,
-            limit=limit,
+            limit=200,
             with_payload=True,
             with_vectors=False,
         )
 
-        return [
-            Entry(
-                content=point.payload["document"],
-                metadata=point.payload.get("metadata"),
-            )
-            for point in results
-        ]
+        if not results:
+            return {}
 
-    async def _scroll_entries_with_ids(
-        self,
-        collection_name: str,
-        qdrant_filter: models.Filter | None,
-        limit: int,
-    ) -> list[EntryWithId]:
+        doc_map: dict[str, DocumentResult] = {}
+        for point in results:
+            payload = point.payload
+            doc_id = payload.get("document_id")
+            if not doc_id:
+                continue
+            if doc_id not in doc_map:
+                meta_dict = payload.get(METADATA_PATH, {})
+                doc_map[doc_id] = DocumentResult(
+                    document_id=doc_id,
+                    title=payload.get("title", "(untitled)"),
+                    abstract=payload.get("abstract"),
+                    metadata=DocumentMetadata(**meta_dict),
+                    chunk_count=1,
+                )
+            else:
+                doc_map[doc_id].chunk_count += 1
+
+        return doc_map
+
+    def _group_points_to_documents(self, points: list) -> list[DocumentResult]:
         """
-        Scroll through entries in a collection, including point IDs.
+        Group a list of Qdrant points (from search or scroll) into
+        deduplicated DocumentResults, ordered by first appearance.
         """
+        doc_map: dict[str, DocumentResult] = {}
+        order: list[str] = []
+
+        for point in points:
+            payload = point.payload
+            doc_id = payload.get("document_id")
+            if not doc_id:
+                # Legacy point without document_id — wrap as single document
+                doc_id = f"legacy_{point.id}"
+
+            if doc_id not in doc_map:
+                meta_dict = payload.get(METADATA_PATH, {})
+                doc_map[doc_id] = DocumentResult(
+                    document_id=doc_id,
+                    title=payload.get("title", "(untitled)"),
+                    abstract=payload.get("abstract"),
+                    metadata=DocumentMetadata(**meta_dict),
+                    chunk_count=1,
+                )
+                order.append(doc_id)
+            else:
+                doc_map[doc_id].chunk_count += 1
+
+        return [doc_map[doc_id] for doc_id in order]
+
+    async def _get_all_chunks(self, collection_name: str, document_id: str) -> list:
+        """Get all Qdrant points belonging to a document_id."""
+        doc_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=document_id),
+                )
+            ]
+        )
         results, _ = await self._client.scroll(
             collection_name=collection_name,
-            scroll_filter=qdrant_filter,
-            limit=limit,
+            scroll_filter=doc_filter,
+            limit=500,
             with_payload=True,
             with_vectors=False,
         )
+        return results
 
-        return [
-            EntryWithId(
-                id=point.id,
-                content=point.payload["document"],
-                metadata=point.payload.get("metadata"),
-            )
-            for point in results
-        ]
+    async def _get_full_content(self, collection_name: str, document_id: str) -> str | None:
+        """Retrieve full_content from chunk_index 0 of a composed document."""
+        doc_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=document_id),
+                ),
+                models.FieldCondition(
+                    key="chunk_index",
+                    match=models.MatchValue(value=0),
+                ),
+            ]
+        )
+        results, _ = await self._client.scroll(
+            collection_name=collection_name,
+            scroll_filter=doc_filter,
+            limit=1,
+            with_payload=True,
+            with_vectors=False,
+        )
+        if results:
+            return results[0].payload.get("full_content")
+        return None
 
-    async def _update_access_tracking(
+    async def _delete_all_chunks(self, collection_name: str, document_id: str):
+        """Delete all points belonging to a document_id."""
+        doc_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=document_id),
+                )
+            ]
+        )
+        await self._client.delete(
+            collection_name=collection_name,
+            points_selector=models.FilterSelector(filter=doc_filter),
+        )
+
+    async def _update_access_tracking_by_document_ids(
         self,
         collection_name: str,
-        point_ids: list[str],
+        document_ids: list[str],
         score_increment: int,
     ):
         """
-        Update access tracking metadata for the given points.
-        Increments relevance_score and updates last_accessed_at.
-        :param collection_name: The name of the collection.
-        :param point_ids: List of point IDs to update.
-        :param score_increment: How much to increment the relevance_score.
+        Update access tracking on ALL chunks of the given document_ids.
         """
-        if not point_ids:
+        if not document_ids:
             return
 
         now = datetime.now(timezone.utc).isoformat()
 
-        for point_id in point_ids:
-            # Get current metadata
-            points = await self._client.retrieve(
-                collection_name=collection_name,
-                ids=[point_id],
-                with_payload=True,
-                with_vectors=False,
-            )
-            if not points:
-                continue
+        for doc_id in document_ids:
+            chunks = await self._get_all_chunks(collection_name, doc_id)
+            for point in chunks:
+                existing_meta = point.payload.get(METADATA_PATH, {})
+                current_score = existing_meta.get("relevance_score", 0)
 
-            existing_metadata = points[0].payload.get("metadata", {})
-            current_score = existing_metadata.get("relevance_score", 0)
+                updated_meta = existing_meta.copy()
+                updated_meta["relevance_score"] = current_score + score_increment
+                updated_meta["last_accessed_at"] = now
 
-            # Update tracking fields
-            updated_metadata = existing_metadata.copy()
-            updated_metadata["relevance_score"] = current_score + score_increment
-            updated_metadata["last_accessed_at"] = now
-
-            await self._client.set_payload(
-                collection_name=collection_name,
-                payload={METADATA_PATH: updated_metadata},
-                points=[point_id],
-            )
+                await self._client.set_payload(
+                    collection_name=collection_name,
+                    payload={METADATA_PATH: updated_meta},
+                    points=[point.id],
+                )
 
     async def _count_by_filter(
         self,
         collection_name: str,
         qdrant_filter: models.Filter,
     ) -> int:
-        """
-        Count entries matching a filter.
-        """
+        """Count entries matching a filter."""
         result = await self._client.count(
             collection_name=collection_name,
             count_filter=qdrant_filter,
@@ -611,16 +926,10 @@ class QdrantConnector:
         return result.count
 
     async def _ensure_collection_exists(self, collection_name: str):
-        """
-        Ensure that the collection exists, creating it if necessary.
-        :param collection_name: The name of the collection to ensure exists.
-        """
+        """Ensure the collection exists, creating it with indexes if necessary."""
         collection_exists = await self._client.collection_exists(collection_name)
         if not collection_exists:
-            # Create the collection with the appropriate vector size
             vector_size = self._embedding_provider.get_vector_size()
-
-            # Use the vector name as defined in the embedding provider
             vector_name = self._embedding_provider.get_vector_name()
             await self._client.create_collection(
                 collection_name=collection_name,
@@ -632,11 +941,22 @@ class QdrantConnector:
                 },
             )
 
-            # Create payload indexes if configured
+            # Create payload indexes for the two-level model
+            default_indexes: dict[str, models.PayloadSchemaType] = {
+                "document_id": models.PayloadSchemaType.KEYWORD,
+                "chunk_index": models.PayloadSchemaType.INTEGER,
+                f"{METADATA_PATH}.source_type": models.PayloadSchemaType.KEYWORD,
+                f"{METADATA_PATH}.category": models.PayloadSchemaType.KEYWORD,
+                f"{METADATA_PATH}.tags": models.PayloadSchemaType.KEYWORD,
+            }
+
+            # Merge with any user-configured indexes
             if self._field_indexes:
-                for field_name, field_type in self._field_indexes.items():
-                    await self._client.create_payload_index(
-                        collection_name=collection_name,
-                        field_name=field_name,
-                        field_schema=field_type,
-                    )
+                default_indexes.update(self._field_indexes)
+
+            for field_name, field_type in default_indexes.items():
+                await self._client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=field_type,
+                )
