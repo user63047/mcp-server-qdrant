@@ -2,15 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install git (required for pip install from GitHub)
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
-
 # Install uv for package management
 RUN pip install --no-cache-dir uv
 
-# Install mcp-server-qdrant from GitHub fork
-RUN uv pip install --system --no-cache-dir \
-    "mcp-server-qdrant @ git+https://github.com/user63047/mcp-server-qdrant.git@feature/container-deployment"
+# Install mcp-server-qdrant from local source
+COPY . .
+RUN uv pip install --system --no-cache-dir .
 
 # Port for combined MCP + REST API
 EXPOSE 8000
