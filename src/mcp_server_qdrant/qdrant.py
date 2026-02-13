@@ -51,6 +51,7 @@ class OperationResult(BaseModel):
     success: bool
     message: str
     count: int = 0
+    document_id: str | None = None  # returned on store/update for sync consumers
     documents: list[DocumentResult] | None = None  # populated on disambiguation
 
 
@@ -106,6 +107,7 @@ class QdrantConnector:
         metadata: Metadata | None = None,
         *,
         collection_name: str | None = None,
+        document_id: str | None = None,
     ) -> OperationResult:
         """
         Store a document: generate abstract, chunk text, embed each chunk,
@@ -115,6 +117,7 @@ class QdrantConnector:
         :param content: Full document text.
         :param metadata: Optional metadata dict (category, tags, source_type, source_ref, ...).
         :param collection_name: Target collection (uses default if None).
+        :param document_id: Optional document_id (used by sync to preserve ID on re-index).
         :return: OperationResult with success info.
         """
         collection_name = collection_name or self._default_collection_name
@@ -147,7 +150,7 @@ class QdrantConnector:
         if not chunks:
             return OperationResult(success=False, message="Empty content, nothing to store.")
 
-        doc_id = generate_document_id()
+        doc_id = document_id or generate_document_id()
 
         # Embed all chunks
         embeddings = await self._embedding_provider.embed_documents(chunks)
@@ -187,6 +190,7 @@ class QdrantConnector:
             success=True,
             message=f"Stored document '{title}' with {len(chunks)} chunk(s).",
             count=len(chunks),
+            document_id=doc_id,
         )
 
     # ----- search / find -------------------------------------------------
@@ -313,7 +317,7 @@ class QdrantConnector:
         if not collection_exists:
             return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        doc_map = await self.resolve_documents(filter_dict, collection_name)
 
         if not doc_map:
             return OperationResult(success=False, message="No matching documents found.", count=0)
@@ -342,7 +346,7 @@ class QdrantConnector:
             )
 
         # Delete all chunks of this document
-        await self._delete_all_chunks(collection_name, doc_id)
+        await self.delete_all_chunks(collection_name, doc_id)
 
         return OperationResult(
             success=True,
@@ -377,7 +381,7 @@ class QdrantConnector:
         if not collection_exists:
             return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        doc_map = await self.resolve_documents(filter_dict, collection_name)
 
         if not doc_map:
             return OperationResult(success=False, message="No matching documents found.", count=0)
@@ -414,7 +418,7 @@ class QdrantConnector:
         existing_meta["last_accessed_at"] = now
 
         # Delete old chunks
-        await self._delete_all_chunks(collection_name, doc_id)
+        await self.delete_all_chunks(collection_name, doc_id)
 
         # Generate new abstract
         abstract = None
@@ -442,7 +446,7 @@ class QdrantConnector:
             }
             if abstract is not None:
                 payload["abstract"] = abstract
-            if i == 0:
+            if i == 0 and doc_meta.source_type == SourceType.COMPOSED:
                 payload["full_content"] = new_content
 
             points.append(
@@ -459,6 +463,7 @@ class QdrantConnector:
             success=True,
             message=f"Updated document '{doc_result.title}' with {len(chunks)} chunk(s).",
             count=1,
+            document_id=doc_id,
         )
 
     # ----- append --------------------------------------------------------
@@ -486,7 +491,7 @@ class QdrantConnector:
         if not collection_exists:
             return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        doc_map = await self.resolve_documents(filter_dict, collection_name)
 
         if not doc_map:
             return OperationResult(success=False, message="No matching documents found.", count=0)
@@ -553,7 +558,7 @@ class QdrantConnector:
         if not collection_exists:
             return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        doc_map = await self.resolve_documents(filter_dict, collection_name)
         if not doc_map:
             return OperationResult(success=False, message="No matching documents found.", count=0)
 
@@ -602,7 +607,7 @@ class QdrantConnector:
         if not collection_exists:
             return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        doc_map = await self.resolve_documents(filter_dict, collection_name)
         if not doc_map:
             return OperationResult(success=False, message="No matching documents found.", count=0)
 
@@ -653,7 +658,7 @@ class QdrantConnector:
         if not collection_exists:
             return OperationResult(success=False, message="Collection does not exist.", count=0)
 
-        doc_map = await self._resolve_documents(filter_dict, collection_name)
+        doc_map = await self.resolve_documents(filter_dict, collection_name)
         if not doc_map:
             return OperationResult(success=False, message="No matching documents found.", count=0)
 
@@ -749,7 +754,7 @@ class QdrantConnector:
 
         return models.Filter(must=conditions) if conditions else None
 
-    async def _resolve_documents(
+    async def resolve_documents(
         self,
         filter_dict: dict,
         collection_name: str,
@@ -867,7 +872,7 @@ class QdrantConnector:
             return results[0].payload.get("full_content")
         return None
 
-    async def _delete_all_chunks(self, collection_name: str, document_id: str):
+    async def delete_all_chunks(self, collection_name: str, document_id: str):
         """Delete all points belonging to a document_id."""
         doc_filter = models.Filter(
             must=[

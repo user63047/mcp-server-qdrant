@@ -4,21 +4,63 @@ import argparse
 def main():
     """
     Main entry point for the mcp-server-qdrant script defined
-    in pyproject.toml. It runs the MCP server with a specific transport
-    protocol.
+    in pyproject.toml.
+
+    Two modes:
+    - stdio: MCP only (for local clients like Msty via STDIO)
+    - streamable-http: Combined MCP + REST API on a single port
+      (for container deployment with HTTP consumers)
     """
 
-    # Parse the command-line arguments to determine the transport protocol.
     parser = argparse.ArgumentParser(description="mcp-server-qdrant")
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse", "streamable-http"],
+        choices=["stdio", "streamable-http"],
         default="stdio",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host to bind to (HTTP mode only)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to listen on (HTTP mode only)",
     )
     args = parser.parse_args()
 
-    # Import is done here to make sure environment variables are loaded
-    # only after we make the changes.
+    # Import here so environment variables are loaded after argument parsing
     from mcp_server_qdrant.server import mcp
 
-    mcp.run(transport=args.transport)
+    if args.transport == "stdio":
+        # STDIO mode: MCP only, no REST API
+        mcp.run(transport="stdio")
+    else:
+        # HTTP mode: combined MCP + REST API on single port
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+
+        from mcp_server_qdrant.rest_api import create_rest_api
+
+        # REST API shares the QdrantConnector with MCP server
+        rest_app = create_rest_api(mcp.qdrant_connector)
+
+        # MCP Streamable HTTP ASGI app
+        mcp_app = mcp.streamable_http_app()
+
+        # Combined ASGI app: single port, path-based routing
+        #   /mcp/    → MCP Streamable HTTP (LLM clients)
+        #   /api/v1/ → REST API (n8n sync flows)
+        app = Starlette(
+            routes=[
+                Mount("/mcp", app=mcp_app),
+                Mount("/", app=rest_app),
+            ]
+        )
+
+        uvicorn.run(app, host=args.host, port=args.port)
+
+

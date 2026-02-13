@@ -5,17 +5,33 @@ WORKDIR /app
 # Install uv for package management
 RUN pip install --no-cache-dir uv
 
-# Install the mcp-server-qdrant package
-RUN uv pip install --system --no-cache-dir mcp-server-qdrant
+# Install mcp-server-qdrant from GitHub fork
+RUN uv pip install --system --no-cache-dir \
+    "mcp-server-qdrant @ git+https://github.com/user63047/mcp-server-qdrant.git@feature/container-deployment"
 
-# Expose the default port for SSE transport
+# Port for combined MCP + REST API
 EXPOSE 8000
 
-# Set environment variables with defaults that can be overridden at runtime
+# Environment variables with sensible defaults for homelab deployment
+# --- Embedding ---
+ENV EMBEDDING_PROVIDER="ollama"
+ENV EMBEDDING_MODEL="embeddinggemma:300m"
+ENV OLLAMA_URL=""
+
+# --- Summary ---
+ENV SUMMARY_MODEL=""
+ENV SUMMARY_PROVIDER="ollama"
+
+# --- Qdrant ---
 ENV QDRANT_URL=""
 ENV QDRANT_API_KEY=""
-ENV COLLECTION_NAME="default-collection"
-ENV EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+ENV COLLECTION_NAME=""
+ENV QDRANT_SEARCH_LIMIT="10"
+ENV QDRANT_READ_ONLY="false"
 
-# Run the server with SSE transport
-CMD uvx mcp-server-qdrant --transport sse
+# --- Chunking ---
+ENV CHUNK_SIZE="1500"
+ENV CHUNK_OVERLAP="375"
+
+# Run combined MCP + REST API server
+CMD ["mcp-server-qdrant", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]
