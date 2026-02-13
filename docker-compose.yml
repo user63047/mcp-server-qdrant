@@ -1,8 +1,6 @@
 services:
   mcp-server-qdrant:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/user63047/mcp-server-qdrant:feature-container-deployment
     container_name: mcp-server-qdrant
     restart: unless-stopped
     ports:
@@ -15,28 +13,23 @@ services:
       - EMBEDDING_MODEL=embeddinggemma:300m
       - OLLAMA_URL=http://ollama:11434
       # --- Summary ---
-      - SUMMARY_MODEL=gemma3:4b
+      - SUMMARY_MODEL=${SUMMARY_MODEL:-}
       - SUMMARY_PROVIDER=ollama
       # --- Qdrant ---
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_API_KEY=R#p0DF9Cxxxx
-      - COLLECTION_NAME=test-collection
+      - QDRANT_API_KEY=${QDRANT_API_KEY:?Qdrant API key required}
+      - COLLECTION_NAME=${COLLECTION_NAME:-}
       - QDRANT_SEARCH_LIMIT=10
       - QDRANT_READ_ONLY=false
       # --- Chunking ---
       - CHUNK_SIZE=1500
       - CHUNK_OVERLAP=375
-    depends_on:
-      ollama:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
 
 networks:
   ollama-webui-network:
