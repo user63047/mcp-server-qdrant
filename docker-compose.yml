@@ -4,7 +4,7 @@ services:
     container_name: mcp-server-qdrant
     restart: unless-stopped
     ports:
-      - "192.168.1.170:8000:8000"
+      - "192.168.1.170:8011:8000"
     networks:
       - ollama-webui-network
     environment:
