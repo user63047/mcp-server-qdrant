@@ -58,7 +58,8 @@ def main():
             routes=[
                 *mcp_app.routes,
                 Mount("/", app=rest_app),
-            ]
+            ],
+            lifespan=mcp_app.lifespan,
         )
 
         uvicorn.run(app, host=args.host, port=args.port)
