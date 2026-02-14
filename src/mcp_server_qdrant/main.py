@@ -48,15 +48,15 @@ def main():
         # REST API shares the QdrantConnector with MCP server
         rest_app = create_rest_api(mcp.qdrant_connector)
 
-        # MCP Streamable HTTP ASGI app
-        mcp_app = mcp.streamable_http_app()
+        # MCP HTTP ASGI app (includes /mcp route internally)
+        mcp_app = mcp.http_app()
 
         # Combined ASGI app: single port, path-based routing
-        #   /mcp/    → MCP Streamable HTTP (LLM clients)
+        #   /mcp/    → MCP Streamable HTTP (from mcp_app's own routes)
         #   /api/v1/ → REST API (n8n sync flows)
         app = Starlette(
             routes=[
-                Mount("/mcp", app=mcp_app),
+                *mcp_app.routes,
                 Mount("/", app=rest_app),
             ]
         )
