@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient, models
 
 from mcp_server_qdrant.chunking import chunk_text
+from mcp_server_qdrant.html import extract_image_refs, is_html, strip_html
 from mcp_server_qdrant.embeddings.base import EmbeddingProvider
 from mcp_server_qdrant.models import (
     ChunkPayload,
@@ -140,18 +141,30 @@ class QdrantConnector:
             last_accessed_at=now,
         )
 
-        # Generate abstract and auto-tags
+        # HTML processing: strip tags for embedding, preserve image refs for future use
+        if is_html(content):
+            image_refs = extract_image_refs(content)
+            if image_refs:
+                logger.info(
+                    "Found %d image(s) in '%s' (not yet processed)",
+                    len(image_refs), title,
+                )
+            text_content = strip_html(content)
+        else:
+            text_content = content
+
+        # Generate abstract and auto-tags (from plaintext)
         abstract = None
         if self._summary_provider and self._summary_provider.enabled:
-            abstract = await self._summary_provider.generate_abstract(content, title)
-            auto_tags = await self._summary_provider.generate_tags(content, title)
+            abstract = await self._summary_provider.generate_abstract(text_content, title)
+            auto_tags = await self._summary_provider.generate_tags(text_content, title)
             # Merge auto-tags with manually provided tags (manual takes priority)
             existing_tags = doc_meta.tags or []
             merged_tags = list(set(existing_tags + auto_tags))
             doc_meta.tags = merged_tags
 
-        # Chunk the content
-        chunks = chunk_text(content, self._chunking_settings)
+        # Chunk the plaintext content
+        chunks = chunk_text(text_content, self._chunking_settings)
         if not chunks:
             return OperationResult(success=False, message="Empty content, nothing to store.")
 
@@ -425,18 +438,24 @@ class QdrantConnector:
         # Delete old chunks
         await self.delete_all_chunks(collection_name, doc_id)
 
-        # Generate new abstract and auto-tags
+        # HTML processing
+        if is_html(new_content):
+            text_content = strip_html(new_content)
+        else:
+            text_content = new_content
+
+        # Generate new abstract and auto-tags (from plaintext)
         abstract = None
         if self._summary_provider and self._summary_provider.enabled:
-            abstract = await self._summary_provider.generate_abstract(new_content, doc_result.title)
-            auto_tags = await self._summary_provider.generate_tags(new_content, doc_result.title)
+            abstract = await self._summary_provider.generate_abstract(text_content, doc_result.title)
+            auto_tags = await self._summary_provider.generate_tags(text_content, doc_result.title)
             # Merge auto-tags with existing tags
             current_tags = existing_meta.get("tags", [])
             merged_tags = list(set(current_tags + auto_tags))
             existing_meta["tags"] = merged_tags
 
         # Re-chunk and re-embed
-        chunks = chunk_text(new_content, self._chunking_settings)
+        chunks = chunk_text(text_content, self._chunking_settings)
         if not chunks:
             return OperationResult(success=False, message="New content is empty.", count=0)
 
