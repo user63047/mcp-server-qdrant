@@ -62,6 +62,14 @@ def main():
             lifespan=mcp_app.lifespan,
         )
 
-        uvicorn.run(app, host=args.host, port=args.port)
+        # Fix: rewrite /mcp → /mcp/ for clients that strip trailing slash
+        _inner = app
+
+        async def app_wrapper(scope, receive, send):
+            if scope["type"] == "http" and scope["path"] == "/mcp":
+                scope = dict(scope, path="/mcp/")
+            await _inner(scope, receive, send)
+
+        uvicorn.run(app_wrapper, host=args.host, port=args.port)
 
 
