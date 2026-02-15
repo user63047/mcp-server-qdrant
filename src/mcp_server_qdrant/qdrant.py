@@ -689,6 +689,67 @@ class QdrantConnector:
             count=updated_count,
         )
 
+    # ----- resolve / chunk management ------------------------------------
+
+    async def resolve_documents(
+        self,
+        filter_dict: dict,
+        collection_name: str,
+    ) -> dict[str, DocumentResult]:
+        """
+        Find all documents matching a filter. Returns a dict of
+        document_id → DocumentResult.
+        """
+        qdrant_filter = self._build_filter(filter_dict)
+        if not qdrant_filter:
+            return {}
+
+        results, _ = await self._client.scroll(
+            collection_name=collection_name,
+            scroll_filter=qdrant_filter,
+            limit=200,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        if not results:
+            return {}
+
+        doc_map: dict[str, DocumentResult] = {}
+        for point in results:
+            payload = point.payload
+            doc_id = payload.get("document_id")
+            if not doc_id:
+                continue
+            if doc_id not in doc_map:
+                meta_dict = payload.get(METADATA_PATH, {})
+                doc_map[doc_id] = DocumentResult(
+                    document_id=doc_id,
+                    title=payload.get("title", "(untitled)"),
+                    abstract=payload.get("abstract"),
+                    metadata=DocumentMetadata(**meta_dict),
+                    chunk_count=1,
+                )
+            else:
+                doc_map[doc_id].chunk_count += 1
+
+        return doc_map
+
+    async def delete_all_chunks(self, collection_name: str, document_id: str):
+        """Delete all points belonging to a document_id."""
+        doc_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=document_id),
+                )
+            ]
+        )
+        await self._client.delete(
+            collection_name=collection_name,
+            points_selector=models.FilterSelector(filter=doc_filter),
+        )
+
     # =====================================================================
     # Internal helpers
     # =====================================================================
@@ -753,50 +814,6 @@ class QdrantConnector:
                     )
 
         return models.Filter(must=conditions) if conditions else None
-
-    async def resolve_documents(
-        self,
-        filter_dict: dict,
-        collection_name: str,
-    ) -> dict[str, DocumentResult]:
-        """
-        Find all documents matching a filter. Returns a dict of
-        document_id → DocumentResult.
-        """
-        qdrant_filter = self._build_filter(filter_dict)
-        if not qdrant_filter:
-            return {}
-
-        results, _ = await self._client.scroll(
-            collection_name=collection_name,
-            scroll_filter=qdrant_filter,
-            limit=200,
-            with_payload=True,
-            with_vectors=False,
-        )
-
-        if not results:
-            return {}
-
-        doc_map: dict[str, DocumentResult] = {}
-        for point in results:
-            payload = point.payload
-            doc_id = payload.get("document_id")
-            if not doc_id:
-                continue
-            if doc_id not in doc_map:
-                meta_dict = payload.get(METADATA_PATH, {})
-                doc_map[doc_id] = DocumentResult(
-                    document_id=doc_id,
-                    title=payload.get("title", "(untitled)"),
-                    abstract=payload.get("abstract"),
-                    metadata=DocumentMetadata(**meta_dict),
-                    chunk_count=1,
-                )
-            else:
-                doc_map[doc_id].chunk_count += 1
-
-        return doc_map
 
     def _group_points_to_documents(self, points: list) -> list[DocumentResult]:
         """
@@ -871,21 +888,6 @@ class QdrantConnector:
         if results:
             return results[0].payload.get("full_content")
         return None
-
-    async def delete_all_chunks(self, collection_name: str, document_id: str):
-        """Delete all points belonging to a document_id."""
-        doc_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="document_id",
-                    match=models.MatchValue(value=document_id),
-                )
-            ]
-        )
-        await self._client.delete(
-            collection_name=collection_name,
-            points_selector=models.FilterSelector(filter=doc_filter),
-        )
 
     async def _update_access_tracking_by_document_ids(
         self,
