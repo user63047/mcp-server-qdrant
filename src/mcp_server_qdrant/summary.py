@@ -24,6 +24,15 @@ SUMMARY_SYSTEM_PROMPT = (
     "Respond with ONLY the abstract, no preamble or explanation."
 )
 
+# System prompt for tag generation
+TAGS_SYSTEM_PROMPT = (
+    "You are a tagging assistant. Generate 3-6 concise, lowercase tags for the following document. "
+    "Tags should capture the key topics, technologies, and concepts. "
+    "Use single words or short hyphenated phrases (e.g. 'docker', 'network-config', 'backup'). "
+    "Respond with ONLY a comma-separated list of tags, nothing else. "
+    "Example: docker, networking, linux, firewall"
+)
+
 
 class SummaryProvider:
     """
@@ -97,6 +106,66 @@ class SummaryProvider:
         except Exception as e:
             logger.error("Unexpected error generating abstract: %s", e)
             return None
+
+    async def generate_tags(self, text: str, title: str | None = None) -> list[str]:
+        """
+        Generate tags for the given document text.
+
+        :param text: The full document text.
+        :param title: Optional document title for additional context.
+        :return: List of generated tags, or empty list if disabled or fails.
+        """
+        if not self.enabled:
+            return []
+
+        prompt = text
+        if title:
+            prompt = f"Title: {title}\n\n{text}"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self._ollama_url}/api/generate",
+                    json={
+                        "model": self._settings.summary_model,
+                        "system": TAGS_SYSTEM_PROMPT,
+                        "prompt": prompt,
+                        "stream": False,
+                    },
+                    timeout=120.0,
+                )
+                response.raise_for_status()
+                data = response.json()
+                raw = data.get("response", "").strip()
+
+                if raw:
+                    tags = [
+                        tag.strip().lower().strip('"\'')
+                        for tag in raw.split(",")
+                        if tag.strip()
+                    ]
+                    # Filter out overly long or empty tags
+                    tags = [t for t in tags if 0 < len(t) <= 40]
+                    logger.debug(
+                        "Generated %d tags for document '%s': %s",
+                        len(tags),
+                        title or "(untitled)",
+                        tags,
+                    )
+                    return tags
+
+                logger.warning("Empty tags returned for document '%s'", title or "(untitled)")
+                return []
+
+        except httpx.HTTPStatusError as e:
+            logger.error("Ollama API error generating tags: %s", e)
+            return []
+        except httpx.ConnectError as e:
+            logger.error("Cannot connect to Ollama at %s: %s", self._ollama_url, e)
+            return []
+        except Exception as e:
+            logger.error("Unexpected error generating tags: %s", e)
+            return []
 
 
 def create_summary_provider(

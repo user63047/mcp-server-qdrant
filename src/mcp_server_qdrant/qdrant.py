@@ -140,10 +140,15 @@ class QdrantConnector:
             last_accessed_at=now,
         )
 
-        # Generate abstract
+        # Generate abstract and auto-tags
         abstract = None
         if self._summary_provider and self._summary_provider.enabled:
             abstract = await self._summary_provider.generate_abstract(content, title)
+            auto_tags = await self._summary_provider.generate_tags(content, title)
+            # Merge auto-tags with manually provided tags (manual takes priority)
+            existing_tags = doc_meta.tags or []
+            merged_tags = list(set(existing_tags + auto_tags))
+            doc_meta.tags = merged_tags
 
         # Chunk the content
         chunks = chunk_text(content, self._chunking_settings)
@@ -420,10 +425,15 @@ class QdrantConnector:
         # Delete old chunks
         await self.delete_all_chunks(collection_name, doc_id)
 
-        # Generate new abstract
+        # Generate new abstract and auto-tags
         abstract = None
         if self._summary_provider and self._summary_provider.enabled:
             abstract = await self._summary_provider.generate_abstract(new_content, doc_result.title)
+            auto_tags = await self._summary_provider.generate_tags(new_content, doc_result.title)
+            # Merge auto-tags with existing tags
+            current_tags = existing_meta.get("tags", [])
+            merged_tags = list(set(current_tags + auto_tags))
+            existing_meta["tags"] = merged_tags
 
         # Re-chunk and re-embed
         chunks = chunk_text(new_content, self._chunking_settings)
