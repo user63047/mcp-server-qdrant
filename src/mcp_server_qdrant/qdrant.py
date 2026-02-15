@@ -955,6 +955,7 @@ class QdrantConnector:
                 f"{METADATA_PATH}.source_type": models.PayloadSchemaType.KEYWORD,
                 f"{METADATA_PATH}.category": models.PayloadSchemaType.KEYWORD,
                 f"{METADATA_PATH}.tags": models.PayloadSchemaType.KEYWORD,
+                f"{METADATA_PATH}.source_ref": models.PayloadSchemaType.KEYWORD,
             }
 
             # Merge with any user-configured indexes

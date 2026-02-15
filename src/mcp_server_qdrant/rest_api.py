@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from mcp_server_qdrant.models import DocumentMetadata
 from mcp_server_qdrant.qdrant import QdrantConnector
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,24 @@ class SyncResponse(BaseModel):
     message: str
     document_id: str | None = None
     chunk_count: int = 0
+
+
+class DocumentSummary(BaseModel):
+    """Summary of a document for list responses."""
+
+    document_id: str
+    title: str
+    abstract: str | None = None
+    chunk_count: int = 0
+    metadata: DocumentMetadata
+
+
+class ListResponse(BaseModel):
+    """Response for listing documents."""
+
+    success: bool
+    count: int
+    documents: list[DocumentSummary]
 
 
 # --- API Factory ---
@@ -187,6 +206,69 @@ def create_rest_api(qdrant_connector: QdrantConnector) -> FastAPI:
             raise
         except Exception as e:
             logger.error("Delete failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/v1/documents", response_model=ListResponse)
+    async def list_documents(
+        collection_name: str = Query(description="Collection to search"),
+        source_ref: str | None = Query(default=None, description="Filter by source_ref (exact match)"),
+        source_type: str | None = Query(default=None, description="Filter by source_type (e.g. 'trilium')"),
+        category: str | None = Query(default=None, description="Filter by category"),
+        title: str | None = Query(default=None, description="Filter by title (text match)"),
+    ) -> ListResponse:
+        """
+        List documents matching optional filters.
+        Used by n8n to look up documents by source_ref before update/delete.
+        Returns document-level summaries (no chunk content).
+        """
+        try:
+            filter_dict: dict[str, Any] = {}
+            if source_ref is not None:
+                filter_dict["source_ref"] = source_ref
+            if source_type is not None:
+                filter_dict["source_type"] = source_type
+            if category is not None:
+                filter_dict["category"] = category
+            if title is not None:
+                filter_dict["title"] = title
+
+            if not filter_dict:
+                # No filter = list all (capped at 100)
+                doc_map = await qdrant_connector.list_entries(
+                    limit=100, collection_name=collection_name
+                )
+                documents = [
+                    DocumentSummary(
+                        document_id=doc.document_id,
+                        title=doc.title,
+                        abstract=doc.abstract,
+                        chunk_count=doc.chunk_count,
+                        metadata=doc.metadata,
+                    )
+                    for doc in doc_map
+                ]
+            else:
+                doc_map = await qdrant_connector.resolve_documents(
+                    filter_dict, collection_name
+                )
+                documents = [
+                    DocumentSummary(
+                        document_id=doc_id,
+                        title=doc.title,
+                        abstract=doc.abstract,
+                        chunk_count=doc.chunk_count,
+                        metadata=doc.metadata,
+                    )
+                    for doc_id, doc in doc_map.items()
+                ]
+
+            return ListResponse(
+                success=True,
+                count=len(documents),
+                documents=documents,
+            )
+        except Exception as e:
+            logger.error("List failed: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/v1/health")
