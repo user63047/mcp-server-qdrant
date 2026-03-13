@@ -130,20 +130,41 @@ class DocumentResult(BaseModel):
     """
     Document-level result returned from search/list operations.
     Chunks are grouped by document_id and deduplicated.
+
+    The chunks field contains the actual chunk texts (the embedded content).
+    total_chunk_count is the total number of chunks in the document,
+    while len(chunks) may be fewer if not all chunks were loaded (hybrid mode).
     """
 
     document_id: str
     title: str
     abstract: str | None = None
     metadata: DocumentMetadata = Field(default_factory=DocumentMetadata)
-    chunk_count: int = Field(default=1, description="Total number of chunks.")
+    chunks: list[str] = Field(
+        default_factory=list,
+        description="Chunk texts included in this result (may be partial).",
+    )
+    chunk_count: int = Field(
+        default=1,
+        description="Number of matched/loaded chunks in this result.",
+    )
+    total_chunk_count: int | None = Field(
+        default=None,
+        description="Total number of chunks in the document (None if unknown).",
+    )
 
     def format_for_llm(self) -> str:
-        """Format this document result for LLM consumption."""
+        """Format this document result for LLM consumption.
+
+        Includes chunk content so the LLM has access to the actual
+        information, not just the abstract summary.
+        """
         parts = [f"<document id=\"{self.document_id}\">"]
         parts.append(f"<title>{self.title}</title>")
         if self.abstract:
             parts.append(f"<abstract>{self.abstract}</abstract>")
+
+        # Metadata
         meta = self.metadata
         meta_parts = []
         if meta.source_type:
@@ -156,6 +177,27 @@ class DocumentResult(BaseModel):
             meta_parts.append(f"tags={','.join(meta.tags)}")
         if meta_parts:
             parts.append(f"<metadata>{' | '.join(meta_parts)}</metadata>")
+
+        # Chunk content
+        if self.chunks:
+            parts.append("<content>")
+            for i, chunk_text in enumerate(self.chunks):
+                if len(self.chunks) > 1:
+                    parts.append(f"--- chunk {i} ---")
+                parts.append(chunk_text)
+            parts.append("</content>")
+
+        # Hint for partial loading
+        if (
+            self.total_chunk_count is not None
+            and len(self.chunks) < self.total_chunk_count
+        ):
+            parts.append(
+                f"<note>Showing {len(self.chunks)} of {self.total_chunk_count} chunks. "
+                f"Use qdrant-find with filter {{\"document_id\": \"{self.document_id}\"}} "
+                f"to load the full document.</note>"
+            )
+
         parts.append("</document>")
         return "\n".join(parts)
 

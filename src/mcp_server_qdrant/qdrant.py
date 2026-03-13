@@ -89,6 +89,7 @@ class QdrantConnector:
         self._field_indexes = field_indexes
         self._chunking_settings = chunking_settings or ChunkingSettings()
         self._summary_provider = summary_provider
+        self._chunk_autoload_threshold = self._chunking_settings.chunk_autoload_threshold
 
     # =====================================================================
     # Public API
@@ -253,6 +254,11 @@ class QdrantConnector:
         # Group by document_id and deduplicate
         documents = self._group_points_to_documents(search_results.points)
 
+        # Hybrid chunk loading: enrich with full content for small documents
+        documents = await self._enrich_documents_with_chunks(
+            collection_name, documents
+        )
+
         # Access tracking: update all chunks of found documents (find = +3)
         all_doc_ids = [doc.document_id for doc in documents]
         await self._update_access_tracking_by_document_ids(
@@ -302,6 +308,11 @@ class QdrantConnector:
             return []
 
         documents = self._group_points_to_documents(results)[:limit]
+
+        # Hybrid chunk loading: enrich with full content for small documents
+        documents = await self._enrich_documents_with_chunks(
+            collection_name, documents
+        )
 
         # Access tracking (list = +1)
         all_doc_ids = [doc.document_id for doc in documents]
@@ -848,6 +859,7 @@ class QdrantConnector:
         """
         Group a list of Qdrant points (from search or scroll) into
         deduplicated DocumentResults, ordered by first appearance.
+        Collects chunk texts from the 'document' payload field.
         """
         doc_map: dict[str, DocumentResult] = {}
         order: list[str] = []
@@ -859,6 +871,8 @@ class QdrantConnector:
                 # Legacy point without document_id — wrap as single document
                 doc_id = f"legacy_{point.id}"
 
+            chunk_text = payload.get("document", "")
+
             if doc_id not in doc_map:
                 meta_dict = payload.get(METADATA_PATH, {})
                 doc_map[doc_id] = DocumentResult(
@@ -866,13 +880,64 @@ class QdrantConnector:
                     title=payload.get("title", "(untitled)"),
                     abstract=payload.get("abstract"),
                     metadata=DocumentMetadata(**meta_dict),
+                    chunks=[chunk_text] if chunk_text else [],
                     chunk_count=1,
                 )
                 order.append(doc_id)
             else:
                 doc_map[doc_id].chunk_count += 1
+                if chunk_text:
+                    doc_map[doc_id].chunks.append(chunk_text)
 
         return [doc_map[doc_id] for doc_id in order]
+
+    async def _enrich_documents_with_chunks(
+        self,
+        collection_name: str,
+        documents: list[DocumentResult],
+    ) -> list[DocumentResult]:
+        """
+        Hybrid chunk loading: enrich DocumentResults with chunk content.
+
+        For each document, fetches the total chunk count. If the document
+        has <= chunk_autoload_threshold total chunks, ALL chunks are loaded
+        (sorted by chunk_index) so the LLM gets the complete text. For larger
+        documents, only the already-matched chunks are kept and
+        total_chunk_count is set so format_for_llm() can emit a hint.
+
+        This adds one scroll query per document in the result set. Since
+        search typically returns 5–10 documents and the query is filtered
+        by document_id (indexed), the overhead is minimal.
+        """
+        threshold = self._chunk_autoload_threshold
+
+        for doc in documents:
+            # Skip legacy entries without a real document_id
+            if doc.document_id.startswith("legacy_"):
+                doc.total_chunk_count = doc.chunk_count
+                continue
+
+            all_chunks = await self._get_all_chunks(collection_name, doc.document_id)
+            total = len(all_chunks)
+            doc.total_chunk_count = total
+
+            if total <= threshold:
+                # Small document — load all chunks sorted by chunk_index
+                sorted_chunks = sorted(
+                    all_chunks,
+                    key=lambda p: p.payload.get("chunk_index", 0),
+                )
+                doc.chunks = [
+                    p.payload.get("document", "")
+                    for p in sorted_chunks
+                    if p.payload.get("document")
+                ]
+                doc.chunk_count = len(doc.chunks)
+            else:
+                # Large document — keep only the matched chunks
+                doc.chunk_count = len(doc.chunks)
+
+        return documents
 
     async def _get_all_chunks(self, collection_name: str, document_id: str) -> list:
         """Get all Qdrant points belonging to a document_id."""

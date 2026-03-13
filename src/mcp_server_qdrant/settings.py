@@ -14,7 +14,10 @@ DEFAULT_TOOL_STORE_DESCRIPTION = (
 )
 DEFAULT_TOOL_FIND_DESCRIPTION = (
     "Search for documents in Qdrant by semantic similarity. Returns document-level results "
-    "with title, abstract, and metadata. Use this tool when you need to: \n"
+    "with title, abstract, metadata, and the actual chunk content. "
+    "Small documents are returned in full; for larger documents, only matched chunks "
+    "are included — use a document_id filter to load all chunks if needed. "
+    "Use this tool when you need to: \n"
     " - Find documents by their content \n"
     " - Access knowledge for further analysis \n"
     " - Get personal information about the user \n"
@@ -179,6 +182,15 @@ class ChunkingSettings(BaseSettings):
         default=375,
         validation_alias="CHUNK_OVERLAP",
         description="Overlap between chunks in tokens",
+    )
+    chunk_autoload_threshold: int = Field(
+        default=3,
+        validation_alias="CHUNK_AUTOLOAD_THRESHOLD",
+        description=(
+            "Documents with this many total chunks or fewer will have ALL "
+            "chunks loaded in search/list results (hybrid mode). Larger "
+            "documents only return matched chunks with a hint to load more."
+        ),
     )
 
 
