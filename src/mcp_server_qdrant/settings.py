@@ -253,3 +253,61 @@ class QdrantSettings(BaseSettings):
                     "If 'local_path' is set, 'location' and 'api_key' must be None."
                 )
         return self
+
+
+class CleanupSettings(BaseSettings):
+    """
+    Configuration for the cleanup tool.
+
+    Source types and their thresholds are configured as a comma-separated
+    string in the format 'type:threshold,type:threshold,...'.
+
+    Example:
+        CLEANUP_SOURCE_TYPES=composed:1.0,trilium:1.0,paperless:0.3
+
+    Source types NOT listed here are skipped entirely during cleanup.
+    """
+
+    source_types: str = Field(
+        default="composed:1.0",
+        validation_alias="CLEANUP_SOURCE_TYPES",
+        description=(
+            "Comma-separated list of source_type:threshold pairs. "
+            "Documents of these types with an effective score below their "
+            "threshold will be removed. Types not listed are never cleaned up. "
+            "Example: 'composed:1.0,trilium:1.0,paperless:0.3'"
+        ),
+    )
+    decay_lambda: float = Field(
+        default=0.001,
+        validation_alias="CLEANUP_DECAY_LAMBDA",
+        description="Exponential decay rate. Higher = faster decay.",
+    )
+    dry_run: bool = Field(
+        default=False,
+        validation_alias="CLEANUP_DRY_RUN",
+        description="If true, only report — don't delete.",
+    )
+
+    def parse_source_types(self) -> dict[str, float]:
+        """
+        Parse the source_types string into a dict of {source_type: threshold}.
+
+        Examples:
+            'composed:1.0'                              -> {'composed': 1.0}
+            'composed:1.0,trilium:1.0'                  -> {'composed': 1.0, 'trilium': 1.0}
+            'composed:1.0,trilium:1.0,paperless:0.3'    -> {'composed': 1.0, 'trilium': 1.0, 'paperless': 0.3}
+            'trilium'                                   -> {'trilium': 1.0}  (default threshold)
+        """
+        result: dict[str, float] = {}
+        for entry in self.source_types.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                source_type, threshold_str = entry.split(":", 1)
+                result[source_type.strip()] = float(threshold_str.strip())
+            else:
+                # No threshold specified — use 1.0 as default
+                result[entry.strip()] = 1.0
+        return result
