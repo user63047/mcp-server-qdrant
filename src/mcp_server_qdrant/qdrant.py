@@ -154,15 +154,23 @@ class QdrantConnector:
         else:
             text_content = content
 
-        # Generate abstract and auto-tags (from plaintext)
+        # Generate abstract (from full plaintext)
         abstract = None
         if self._summary_provider and self._summary_provider.enabled:
             abstract = await self._summary_provider.generate_abstract(text_content, title)
-            auto_tags = await self._summary_provider.generate_tags(text_content, title)
-            # Merge auto-tags with manually provided tags (manual takes priority)
-            existing_tags = doc_meta.tags or []
-            merged_tags = list(set(existing_tags + auto_tags))
-            doc_meta.tags = merged_tags
+
+            if abstract:
+                existing_tags = doc_meta.tags or []
+                if existing_tags:
+                    # Re-index path (e.g. sync update): evaluate existing tags
+                    doc_meta.tags = await self._summary_provider.evaluate_tags(
+                        abstract, title, existing_tags
+                    )
+                else:
+                    # New document: generate fresh tags from abstract
+                    doc_meta.tags = await self._summary_provider.generate_tags(
+                        abstract, title
+                    )
 
         # Chunk the plaintext content
         chunks = chunk_text(text_content, self._chunking_settings)
@@ -455,15 +463,17 @@ class QdrantConnector:
         else:
             text_content = new_content
 
-        # Generate new abstract and auto-tags (from plaintext)
+        # Generate new abstract (from full plaintext)
         abstract = None
         if self._summary_provider and self._summary_provider.enabled:
             abstract = await self._summary_provider.generate_abstract(text_content, doc_result.title)
-            auto_tags = await self._summary_provider.generate_tags(text_content, doc_result.title)
-            # Merge auto-tags with existing tags
-            current_tags = existing_meta.get("tags", [])
-            merged_tags = list(set(current_tags + auto_tags))
-            existing_meta["tags"] = merged_tags
+
+            if abstract:
+                # Evaluate existing tags against new content
+                current_tags = existing_meta.get("tags", [])
+                existing_meta["tags"] = await self._summary_provider.evaluate_tags(
+                    abstract, doc_result.title, current_tags
+                )
 
         # Re-chunk and re-embed
         chunks = chunk_text(text_content, self._chunking_settings)
